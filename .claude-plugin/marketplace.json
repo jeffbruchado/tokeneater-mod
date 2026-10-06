@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tokeneater",
+  "description": "tokeneater, the multiplayer cell-eating game, played in a Claude Code pane while a prompt runs.",
+  "owner": {
+    "name": "Jefferson Bruchado"
+  },
+  "plugins": [
+    {
+      "name": "tokeneater",
+      "source": "./",
+      "description": "Play tokeneater, the multiplayer cell-eating game, in a terminal pane while a prompt runs.",
+      "category": "games",
+      "tags": ["game", "multiplayer", "terminal"]
+    }
+  ]
+}

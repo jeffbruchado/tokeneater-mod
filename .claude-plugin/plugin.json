@@ -1,0 +1,29 @@
+{
+  "name": "tokeneater",
+  "version": "0.3.1",
+  "description": "Play tokeneater, the multiplayer cell-eating game, in a terminal pane while a prompt runs.",
+  "author": {
+    "name": "Jefferson Bruchado"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "nickname": {
+      "type": "string",
+      "title": "Nickname",
+      "description": "The name other players see above your cell (up to 16 characters). Empty: the server picks one.",
+      "default": ""
+    },
+    "serverUrl": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "The tokeneater server to play on, as an origin (https://host).",
+      "default": "https://playtokeneater.com"
+    },
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open on prompt",
+      "description": "Open the game's pane by itself when you send a prompt (in a fullscreen terminal at least 144 columns wide). Off: only /tokeneater opens it.",
+      "default": true
+    }
+  }
+}
