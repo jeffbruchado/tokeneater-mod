@@ -1,7 +1,7 @@
 {
   "name": "tokeneater",
-  "version": "0.4.0",
-  "description": "Play tokeneater, the multiplayer cell-eating game, in a terminal pane while a prompt runs.",
+  "version": "0.5.0",
+  "description": "Play tokeneater, the multiplayer cell-eating game, in a Claude Code pane (terminal or desktop app) while a prompt runs.",
   "author": {
     "name": "Jefferson Bruchado"
   },
@@ -16,7 +16,7 @@
     "autoOpen": {
       "type": "boolean",
       "title": "Open on prompt",
-      "description": "Open the game's pane by itself when you send a prompt (in a fullscreen terminal at least 144 columns wide). Off: only /tokeneater opens it.",
+      "description": "Open the game's pane by itself when you send a prompt (in the desktop app, or a fullscreen terminal at least 144 columns wide). Off: only /tokeneater opens it.",
       "default": true
     }
   }

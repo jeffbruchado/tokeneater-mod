@@ -9,9 +9,9 @@
     {
       "name": "tokeneater",
       "source": "./",
-      "description": "Play tokeneater, the multiplayer cell-eating game, in a terminal pane while a prompt runs.",
+      "description": "Play tokeneater, the multiplayer cell-eating game, in a Claude Code pane (terminal or desktop app) while a prompt runs.",
       "category": "games",
-      "tags": ["game", "multiplayer", "terminal"]
+      "tags": ["game", "multiplayer", "terminal", "desktop"]
     }
   ]
 }

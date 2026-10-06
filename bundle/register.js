@@ -6,12 +6,14 @@ function readOptions(options) {
     isAutoOpenOn: options["autoOpen"] !== false
   };
 }
-function bridgeEnv(options, size) {
+function bridgeEnv(options, target) {
   const env = { TE_NICKNAME: options.nickname };
+  const { size, surface } = target;
   if (size !== null) {
     env["TE_COLUMNS"] = String(size.columns);
     env["TE_ROWS"] = String(size.rows);
   }
+  if (surface !== "terminal") env["TE_SURFACE"] = surface;
   return env;
 }
 
@@ -83,8 +85,10 @@ var MOD_HOTKEYS = {
 };
 
 // ../../packages/shared/src/protocol/messages.ts
+var MAX_PLAYERS_PER_ROOM = 50;
 var ROOM_NAME_MAX_BYTES = 32;
 var ROOM_NAME_PATTERN = new RegExp(`^[a-z0-9-]{1,${String(ROOM_NAME_MAX_BYTES)}}$`);
+var MAX_JOIN_EXCLUDE = 5;
 var RECONNECT_GRACE_SECONDS = 5;
 var JOIN_REJECTIONS = ["nickname", "banned"];
 var JOIN_UNAVAILABILITIES = ["capacity", "rate_limited", "unavailable"];
@@ -121,8 +125,133 @@ var MAX_HEADING_ERROR_RAD = Math.PI / 90;
 var RESUME_WINDOW_MS = RECONNECT_GRACE_SECONDS * 1e3;
 
 // ../../packages/shared/src/client/net/lobby-client.ts
+var ROOMS_PATH = "/api/rooms";
+var JOIN_PATH = "/api/join";
+var DEFAULT_RETRY_AFTER_MS = 5e3;
+var MIN_RETRY_AFTER_MS = 1e3;
+var MAX_RETRY_AFTER_MS = 3e4;
+var MS_PER_SECOND = 1e3;
+var HTTP_FORBIDDEN = 403;
+var HTTP_SERVICE_UNAVAILABLE = 503;
+var HTTP_CLIENT_ERRORS_FROM = 400;
+var HTTP_SERVER_ERRORS_FROM = 500;
+function createLobbyClient(fetchFn, client = "web") {
+  return {
+    async rooms() {
+      try {
+        const response = await fetchFn(ROOMS_PATH, { headers: { accept: "application/json" } });
+        if (!response.ok) return { ok: false };
+        const body = await response.json();
+        return isRoomsStatus(body) ? { ok: true, value: body } : { ok: false };
+      } catch {
+        return { ok: false };
+      }
+    },
+    async join(request) {
+      try {
+        const response = await fetchFn(JOIN_PATH, {
+          method: "POST",
+          headers: { accept: "application/json", "content-type": "application/json" },
+          body: JSON.stringify(joinBody(request, client)),
+          cache: "no-store"
+        });
+        return await joinResult(response);
+      } catch {
+        return { ok: false, reason: "unreachable" };
+      }
+    }
+  };
+}
+function joinBody(request, client) {
+  const exclude = request.exclude?.slice(-MAX_JOIN_EXCLUDE) ?? [];
+  const nickname = request.nickname ?? "";
+  return {
+    ...request.room === void 0 ? {} : { room: request.room },
+    ...exclude.length === 0 ? {} : { exclude },
+    ...nickname === "" ? {} : { nickname },
+    ...client === "web" ? {} : { client }
+  };
+}
+async function joinResult(response) {
+  if (response.status === HTTP_SERVICE_UNAVAILABLE) {
+    const reason = refusalReason(await bodyOf(response), isJoinUnavailability) ?? "unavailable";
+    return { ok: false, reason, retryAfterMs: retryAfterMs(response.headers) };
+  }
+  if (response.status === HTTP_FORBIDDEN) {
+    const reason = refusalReason(await bodyOf(response), isJoinRejection);
+    return reason === null ? { ok: false, reason: "refused" } : { ok: false, reason };
+  }
+  if (response.status >= HTTP_CLIENT_ERRORS_FROM && response.status < HTTP_SERVER_ERRORS_FROM) {
+    return { ok: false, reason: "refused" };
+  }
+  if (!response.ok) return { ok: false, reason: "unreachable" };
+  const body = await response.json();
+  if (!isPlacement(body)) return { ok: false, reason: "unreachable" };
+  const { room, socketPath, requested } = body;
+  return { ok: true, room, socketPath, requested: isRequestedRoom(requested) ? requested : null };
+}
 var REJECTIONS = new Set(JOIN_REJECTIONS);
 var UNAVAILABILITIES = new Set(JOIN_UNAVAILABILITIES);
+function isJoinRejection(value) {
+  return REJECTIONS.has(value);
+}
+function isJoinUnavailability(value) {
+  return UNAVAILABILITIES.has(value);
+}
+async function bodyOf(response) {
+  try {
+    return await response.json();
+  } catch {
+    return void 0;
+  }
+}
+function refusalReason(body, isKnown) {
+  if (!isRecord(body) || body["ok"] !== false) return null;
+  const reason = body["reason"];
+  return isKnown(reason) ? reason : null;
+}
+function retryAfterMs(headers) {
+  const value = headers.get("retry-after")?.trim() ?? "";
+  if (!/^\d+$/.test(value)) return DEFAULT_RETRY_AFTER_MS;
+  const waitMs = Number(value) * MS_PER_SECOND;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(MIN_RETRY_AFTER_MS, waitMs));
+}
+function isPlacement(value) {
+  return isRecord(value) && value["ok"] === true && isRoomName(value["room"]) && isSameOriginPath(value["socketPath"]);
+}
+function isRequestedRoom(value) {
+  return isRecord(value) && isRoomName(value["room"]) && (value["outcome"] === "full" || value["outcome"] === "gone");
+}
+function isRoomName(value) {
+  return typeof value === "string" && ROOM_NAME_PATTERN.test(value);
+}
+function isSameOriginPath(value) {
+  return typeof value === "string" && value.startsWith("/") && !value.startsWith("//");
+}
+function isRoomsStatus(value) {
+  if (!isRecord(value)) return false;
+  const rooms = value["rooms"];
+  const totals = value["totals"];
+  return Array.isArray(rooms) && rooms.every(isRoomSummary) && isRecord(totals) && isCount(totals["rooms"]) && isCount(totals["players"]);
+}
+function isRoomSummary(value) {
+  return isRecord(value) && typeof value["name"] === "string" && isCount(value["players"]);
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+function isCount(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+// ../../packages/shared/src/client/net/room-link.ts
+var ROOM_LINK_PREFIX = "/r/";
+function roomPath(room) {
+  return `${ROOM_LINK_PREFIX}${encodeURIComponent(room)}`;
+}
+function roomLink(origin, room) {
+  return `${origin}${roomPath(room)}`;
+}
 
 // ../../packages/shared/src/client/net/site-links.ts
 var SPONSOR_PAGE_PATH = "/sponsor";
@@ -153,11 +282,23 @@ var CONTROL_ROWS = 1;
 var STATUS_ROWS = 1;
 var MAX_RASTER_COLUMNS = 512;
 var MAX_RASTER_ROWS = 256;
+var PLAY_SURFACES = ["terminal", "desktop"];
+var HUD_HEIGHT_PX = 244;
+var DESKTOP_ROW_PX = 18.9;
+var DESKTOP_HUD_ROWS = Math.ceil(HUD_HEIGHT_PX / DESKTOP_ROW_PX);
+var HUD_REDRAW_INTERVAL_MS = 100;
 function rasterSize(bodyColumns, bodyRows) {
-  const columns = Math.min(Math.floor(bodyColumns), MAX_RASTER_COLUMNS);
-  const rows = Math.min(Math.floor(bodyRows) - CONTROL_ROWS, MAX_RASTER_ROWS);
-  if (columns < 1 || rows <= STATUS_ROWS) return null;
-  return { columns, rows };
+  return gameSize(bodyColumns, Math.floor(bodyRows) - CONTROL_ROWS);
+}
+function desktopMapSize(bodyColumns, bodyRows, controlRows) {
+  return gameSize(bodyColumns, Math.floor(bodyRows) - DESKTOP_HUD_ROWS - controlRows);
+}
+function gameSize(columns, rows) {
+  const size = {
+    columns: Math.min(Math.floor(columns), MAX_RASTER_COLUMNS),
+    rows: Math.min(rows, MAX_RASTER_ROWS)
+  };
+  return size.columns < 1 || size.rows <= STATUS_ROWS ? null : size;
 }
 function isSameSize(a, b) {
   return a?.columns === b?.columns && a?.rows === b?.rows;
@@ -165,12 +306,20 @@ function isSameSize(a, b) {
 function isDockable(screen) {
   return screen !== null && screen.isFullscreen && screen.columns >= DOCK_MIN_COLUMNS;
 }
+function playSurfaceOf(surface) {
+  return PLAY_SURFACES.find((play) => play === surface) ?? null;
+}
+function playSurface(surfaces, desktopDocks) {
+  if (surfaces.includes("terminal")) return "terminal";
+  return surfaces.includes("desktop") || desktopDocks !== null ? "desktop" : null;
+}
 function shouldAutoOpen(facts) {
   if (!facts.isAutoOpenOn) return false;
   if (facts.originKind !== "composer" || facts.isOpen) return false;
   if (facts.isMidTurn && facts.wasClosedThisTurn) return false;
+  if (facts.surface === "desktop") return facts.desktopDocks === true;
   const { screen } = facts;
-  return screen !== null && screen.isFullscreen && screen.columns >= AUTO_OPEN_MIN_COLUMNS;
+  return facts.surface === "terminal" && screen !== null && screen.isFullscreen && screen.columns >= AUTO_OPEN_MIN_COLUMNS;
 }
 var BLANK_CELL_BASE64 = "IAAAAAAAAAEAAAAB";
 function blankCells(size) {
@@ -182,12 +331,23 @@ function withThousands(value) {
   return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 var DOCK_NOTICE = `tokeneater needs the fullscreen layout (${MOD_INSTALL.fullscreenCommand}) and a terminal at least ${String(DOCK_MIN_COLUMNS)} columns wide. Then run ${MOD_INSTALL.paneCommand} again.`;
-var SURFACE_NOTICE = "tokeneater plays in the terminal, in its fullscreen layout.";
+var FALLBACK_NOTICE = "tokeneater cannot be played in this pane.";
+var FALLBACK_READING = "Finding a room to play\u2026";
+var FALLBACK_HOME_LABEL = "Play tokeneater in the browser";
+function fallbackRoomLabel(room, seats) {
+  return `Play room ${room} (${String(seats.players)}/${String(seats.max)}) in the browser`;
+}
+var FALLBACK_OPENED_TEXT = "tokeneater is open: it cannot be played here, so it links to a room to play in the browser.";
 var IDLE_NOTICE = "Press r to play.";
 var RESTARTING_NOTICE = "The game stopped: starting it again\u2026";
 var TOO_SMALL_NOTICE = "The pane is too small to play in: make it taller.";
 var RETRY_HINT = "Press r to try again.";
 var OPENED_TEXT = `tokeneater is open: steer with the pointer or ${MOD_HOTKEYS.up} ${MOD_HOTKEYS.left} ${MOD_HOTKEYS.down} ${MOD_HOTKEYS.right}, ${MOD_HOTKEYS.split} splits, ${MOD_HOTKEYS.eject} ejects (after a click on the map, the arrows and Space too). Esc returns to the prompt.`;
+var DESKTOP_KEY_HINT = `Click the map, then ${[MOD_HOTKEYS.up, MOD_HOTKEYS.left, MOD_HOTKEYS.down, MOD_HOTKEYS.right].join(" ").toUpperCase()} or the arrows steer.`;
+function playingElsewhereNotice(surface) {
+  return `tokeneater is playing in ${surface === "desktop" ? "the desktop app" : "the terminal"} now.`;
+}
+var HIDDEN_GAME_NOTICE = "tokeneater is still playing, out of view here: dock the pane again to see it, or close it to leave the game.";
 var CLOSED_TEXT = "tokeneater closed.";
 var COMMAND_DESCRIPTION = "Play tokeneater in a side pane (run again to close it)";
 function turnToast(status) {
@@ -227,23 +387,28 @@ var PANE_KEYS = [
 
 // src/surface-message.ts
 var MAX_PRESSES_PER_MESSAGE = 8;
+var MAX_STEERS_PER_MESSAGE = 8;
 var PANE_ACTIONS = ["split", "eject", "respawn"];
 var KEY_DIRECTIONS = [-1, 0, 1];
 function messageInputs(message) {
   const presses = message.presses.map((action) => ({ kind: "press", action }));
-  return message.steer === void 0 ? presses : [message.steer, ...presses];
+  return [...message.steers ?? [], ...presses];
 }
 function parseSurfaceMessage(data) {
-  if (!isRecord(data) || !hasOnly(data, ["steer", "presses"])) return null;
-  const { steer, presses } = data;
+  if (!isRecord2(data) || !hasOnly(data, ["steers", "presses"])) return null;
+  const { steers, presses } = data;
   if (!Array.isArray(presses) || presses.length > MAX_PRESSES_PER_MESSAGE) return null;
   if (!presses.every(isPaneAction)) return null;
-  if (steer === void 0) return { presses };
-  const parsed = parseSteer(steer);
-  return parsed === null ? null : { steer: parsed, presses };
+  if (steers === void 0) return { presses };
+  if (!Array.isArray(steers) || steers.length > MAX_STEERS_PER_MESSAGE) return null;
+  const parsed = steers.map(parseSteer);
+  return parsed.every(isSteer) ? { steers: parsed, presses } : null;
+}
+function isSteer(value) {
+  return value !== null;
 }
 function parseSteer(value) {
-  if (!isRecord(value)) return null;
+  if (!isRecord2(value)) return null;
   if (value["kind"] === "aim" && hasOnly(value, ["kind", "x", "y"])) {
     const { x, y } = value;
     return isAimOffset(x) && isAimOffset(y) ? { kind: "aim", x, y } : null;
@@ -254,7 +419,7 @@ function parseSteer(value) {
   }
   return null;
 }
-function isRecord(value) {
+function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function hasOnly(value, keys) {
@@ -270,7 +435,77 @@ function isPaneAction(value) {
   return PANE_ACTIONS.some((action) => action === value);
 }
 
+// src/map-rows.ts
+var HEX_COLOUR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+function readMapRows(value) {
+  if (!isRecord3(value)) return null;
+  const { columns, rows } = value;
+  const palette = listOf(value["palette"]);
+  const lines = listOf(value["lines"]);
+  if (!isCount2(columns) || !isCount2(rows) || lines === null) return null;
+  if (palette === null || palette.length === 0 || !palette.every(isHexColour)) return null;
+  const read = [];
+  let rowCount = 0;
+  for (const line of lines) {
+    const mapLine = readLine(line, { columns, colours: palette.length });
+    if (mapLine === null) return null;
+    rowCount += typeof mapLine === "number" ? mapLine : 1;
+    read.push(mapLine);
+  }
+  if (rowCount !== rows) return null;
+  return { columns, rows, palette, lines: read };
+}
+function readLine(value, bounds) {
+  if (isCount2(value)) return value;
+  const items = listOf(value);
+  if (items === null) return null;
+  const segments = [];
+  let end = 0;
+  for (const item of items) {
+    const segment = readSegment(item, bounds.colours);
+    if (segment === null) return null;
+    end += segment[0] + segment[1];
+    segments.push(segment);
+  }
+  return end <= bounds.columns ? segments : null;
+}
+function readSegment(value, colours) {
+  const fields = listOf(value);
+  if (fields === null) return null;
+  const [margin, width, ...rest] = fields;
+  if (!isWhole(margin) || !isCount2(width)) return null;
+  const isColour = (colour) => isWhole(colour) && colour < colours;
+  if (rest.length === 1) {
+    const [colour] = rest;
+    return isColour(colour) && colour > 0 ? [margin, width, colour] : null;
+  }
+  if (rest.length === 2) {
+    const [top, bottom] = rest;
+    return isColour(top) && isColour(bottom) ? [margin, width, top, bottom] : null;
+  }
+  const [background, ink, text] = rest;
+  const isText = rest.length === 3 && typeof text === "string";
+  return isText && isColour(background) && isColour(ink) ? [margin, width, background, ink, text] : null;
+}
+function isHexColour(value) {
+  return typeof value === "string" && HEX_COLOUR.test(value);
+}
+function listOf(value) {
+  return Array.isArray(value) ? value : null;
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isWhole(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+function isCount2(value) {
+  return isWhole(value) && value > 0;
+}
+
 // src/bridge-lines.ts
+var SVG_SOURCE_MAX_CHARS = 131072;
+var SVG_ALT_MAX_CHARS = 200;
 var LineReader = class {
   pending = "";
   /** Takes the next piece of stdout; what the lines it completed said. */
@@ -278,19 +513,26 @@ var LineReader = class {
     const read = this.pending + text;
     const end = read.lastIndexOf("\n");
     this.pending = read.slice(end + 1);
-    const events = [];
-    let frame = null;
-    if (end < 0) return { events, frame };
-    for (const line of read.slice(0, end).split("\n")) {
-      const message = readLine(line);
-      if (message === null) continue;
-      if ("cells" in message) frame = message;
-      else events.push(message);
-    }
-    return { events, frame };
+    let batch = { events: [], frame: null, map: null, hud: null };
+    if (end < 0) return batch;
+    for (const line of read.slice(0, end).split("\n")) batch = takeLine(batch, readLine2(line));
+    return batch;
   }
 };
-function readLine(line) {
+function takeLine(batch, line) {
+  if (line === null) return batch;
+  if ("cells" in line) return { ...batch, frame: line };
+  switch (line.kind) {
+    case "map":
+      return { ...batch, map: line.rows };
+    case "hud":
+      return { ...batch, hud: line.hud };
+    default:
+      batch.events.push(line);
+      return batch;
+  }
+}
+function readLine2(line) {
   const space = line.indexOf(" ");
   if (space < 0) return null;
   const rest = line.slice(space + 1);
@@ -299,6 +541,10 @@ function readLine(line) {
       return readReady(rest);
     case "F":
       return readFrame(rest);
+    case "C":
+      return readMap(rest);
+    case "V":
+      return readHud(rest);
     case "S":
       return readStatus(rest);
     case "E":
@@ -320,19 +566,35 @@ function readFrame(text) {
   if (extra.length > 0 || columns === null || rows === null || cells === void 0) return null;
   return { size: { columns, rows }, cells };
 }
+function readMap(text) {
+  const rows = readMapRows(parseJson(text));
+  return rows === null ? null : { kind: "map", rows };
+}
+function readHud(text) {
+  const value = parseJson(text);
+  if (!isRecord4(value)) return null;
+  const { svg, alt, w, h: h2 } = value;
+  const isHud = typeof svg === "string" && svg.length <= SVG_SOURCE_MAX_CHARS && typeof alt === "string" && alt.length <= SVG_ALT_MAX_CHARS && isLength(w) && isLength(h2);
+  return isHud ? { kind: "hud", hud: { svg, alt, w, h: h2 } } : null;
+}
 function readStatus(text) {
-  let value;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  if (!isRecord2(value)) return null;
+  const value = parseJson(text);
+  if (!isRecord4(value)) return null;
   const { phase, room, mass, isDead } = value;
   const isStatus = typeof phase === "string" && (typeof room === "string" || room === null) && typeof mass === "number" && typeof isDead === "boolean";
   return isStatus ? { kind: "status", status: { phase, room, mass, isDead } } : null;
 }
-function isRecord2(value) {
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return void 0;
+  }
+}
+function isLength(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function wholeNumber(text) {
@@ -421,6 +683,34 @@ async function checkNode($) {
   }
 }
 
+// plugin/hooks/desktop-frames.ts
+function keepMap(host, rows) {
+  host.lastMap = rows;
+}
+function handOutMap(host) {
+  const rows = host.lastMap;
+  if (rows === null || rows === host.answeredMap) return void 0;
+  host.answeredMap = rows;
+  return rows;
+}
+async function keepHud($, host, hud) {
+  host.lastHud = hud;
+  host.hud.isOwed = true;
+  if (host.hud.isPacing) return;
+  host.hud.isPacing = true;
+  while (host.hud.isOwed) {
+    host.hud.isOwed = false;
+    $.ui.invalidate("ui.render");
+    await $.clock.sleep(HUD_REDRAW_INTERVAL_MS);
+  }
+  host.hud.isPacing = false;
+}
+function forgetDesktopFrames(host) {
+  host.lastMap = null;
+  host.answeredMap = null;
+  host.lastHud = null;
+}
+
 // plugin/hooks/host-state.ts
 var RASTER_KEY = "game";
 function createBridgeHost(options) {
@@ -435,7 +725,13 @@ function createBridgeHost(options) {
     problem: null,
     lastFrame: null,
     mountedSize: null,
-    lastStatus: null
+    lastStatus: null,
+    surface: "terminal",
+    lastMap: null,
+    answeredMap: null,
+    lastHud: null,
+    hud: { isPacing: false, isOwed: false },
+    fallback: null
   };
 }
 function hostPhase(host) {
@@ -453,8 +749,9 @@ function cellsFor(host, size) {
 
 // plugin/hooks/bridge-host.ts
 var BRIDGE_ENTRY = "bundle/bridge.mjs";
-async function startBridge($, host) {
+async function startBridge($, host, surface) {
   host.isWanted = true;
+  host.surface = surface;
   if (host.run !== null) return;
   host.starting ??= spawnBridge($, host).finally(() => {
     host.starting = null;
@@ -469,17 +766,17 @@ async function stopBridge($, host) {
   run.isEnding = true;
   await leaveBridge($, run);
 }
-async function sendInput($, host, input) {
+async function sendInput($, host, { input, surface }) {
   const isPlayAgain = input.kind === "press" && input.action === "respawn";
   if (isPlayAgain && hostPhase(host) !== "running") {
     host.restarts = 0;
-    await startBridge($, host);
+    await startBridge($, host, surface);
     return;
   }
   if (host.run !== null) await requestControl($, host.run, inputRequest(input));
 }
-async function forwardMessage($, host, message) {
-  for (const input of messageInputs(message)) await sendInput($, host, input);
+async function forwardMessage($, host, { input: message, surface }) {
+  for (const input of messageInputs(message)) await sendInput($, host, { input, surface });
 }
 function mountPane($, host, size) {
   host.mountedSize = size;
@@ -499,13 +796,15 @@ async function spawnBridge($, host) {
   }
   host.hasNode = true;
   if (!host.isWanted) return;
+  const { mountedSize: size, surface } = host;
   const run = {
     stream: $.process.spawn({
       argv: ["node", `${$.plugin.root}/${BRIDGE_ENTRY}`],
-      env: bridgeEnv(host.options, host.mountedSize)
+      env: bridgeEnv(host.options, { size, surface })
     }),
     control: null,
-    size: host.mountedSize,
+    size,
+    surface,
     lastProblem: null,
     isEnding: false
   };
@@ -525,6 +824,8 @@ async function readBridge($, running) {
       const batch = reader.push(piece.text);
       for (const event of batch.events) takeEvent($, running, event);
       if (batch.frame !== null) await paintFrame($, running.host, batch.frame);
+      if (batch.map !== null) keepMap(running.host, batch.map);
+      if (batch.hud !== null) void keepHud($, running.host, batch.hud);
     }
     end = await stream.result;
   } catch (error) {
@@ -563,12 +864,13 @@ async function bridgeEnded($, running, end) {
   const { host, run } = running;
   host.run = null;
   host.lastFrame = null;
+  forgetDesktopFrames(host);
   if (!host.isWanted) {
     $.ui.invalidate("ui.render");
     return;
   }
   if (run.isEnding) {
-    await startBridge($, host);
+    await startBridge($, host, host.surface);
     return;
   }
   if (!shouldRestart(end, host.restarts)) {
@@ -580,7 +882,7 @@ async function bridgeEnded($, running, end) {
   $.ui.invalidate("ui.render");
   await $.clock.sleep(RESTART_DELAY_MS);
   host.isRestarting = false;
-  if (host.isWanted) await startBridge($, host);
+  if (host.isWanted) await startBridge($, host, run.surface);
   else $.ui.invalidate("ui.render");
 }
 function failBridge($, host, problem) {
@@ -599,16 +901,186 @@ function killBridge($, run) {
   });
 }
 
+// src/desktop-controls.ts
+var KEY_CHROME_COLUMNS = 5;
+var KEY_GAP_COLUMNS = 1;
+function desktopControlRows(columns) {
+  const width = Math.max(1, Math.floor(columns));
+  const buttons = PANE_KEYS.map((key) => key.label.length + KEY_CHROME_COLUMNS);
+  const words = DESKTOP_KEY_HINT.split(" ").map((word) => word.length);
+  return wrappedRows(buttons, KEY_GAP_COLUMNS, width) + wrappedRows(words, 1, width);
+}
+function wrappedRows(widths, gap, width) {
+  let rows = 1;
+  let used = 0;
+  for (const piece of widths) {
+    const next = used === 0 ? piece : used + gap + piece;
+    if (next > width && used > 0) {
+      rows += 1;
+      used = piece;
+    } else {
+      used = next;
+    }
+  }
+  return rows;
+}
+
+// src/fallback.ts
+var GAME_SITE_ORIGIN = "https://playtokeneater.com";
+var ROOMS_URL = `${GAME_SITE_ORIGIN}${ROOMS_PATH}`;
+var ROOMS_READ_TIMEOUT_MS = 3e3;
+async function roomsOf(answer) {
+  const response = lobbyResponseOf(answer);
+  const lobby = createLobbyClient(() => Promise.resolve(response));
+  const read = await lobby.rooms();
+  return read.ok ? read.value : null;
+}
+function fallbackTarget(rooms) {
+  const open = (rooms?.rooms ?? []).filter(
+    (room) => room.players < MAX_PLAYERS_PER_ROOM && ROOM_NAME_PATTERN.test(room.name)
+  );
+  const fullest = open.reduce(
+    (best, room) => best === null || room.players > best.players ? room : best,
+    null
+  );
+  if (fullest === null) return { href: `${GAME_SITE_ORIGIN}/`, label: FALLBACK_HOME_LABEL };
+  return {
+    href: roomLink(GAME_SITE_ORIGIN, fullest.name),
+    label: fallbackRoomLabel(fullest.name, { players: fullest.players, max: MAX_PLAYERS_PER_ROOM })
+  };
+}
+function lobbyResponseOf(answer) {
+  return {
+    ok: answer.ok,
+    status: answer.status,
+    headers: { get: (name) => answer.headers[name.toLowerCase()] ?? null },
+    // Parsed inside the promise: a body that is not JSON rejects, as a `fetch` response's does.
+    json: () => Promise.resolve(answer.text).then((text) => JSON.parse(text))
+  };
+}
+
+// plugin/hooks/fallback-pane.tsx
+var LINK_KEY = "play-in-browser";
+function drawFallback($, e, host) {
+  const { Box, Text, Link } = $.ui.resolve(e);
+  if (host.run !== null) {
+    const isHere = host.run.surface === e.surface;
+    return /* @__PURE__ */ h(Text, null, isHere ? HIDDEN_GAME_NOTICE : playingElsewhereNotice(host.run.surface));
+  }
+  if (host.fallback === null) void readFallback($, host);
+  const target = host.fallback?.target ?? null;
+  return /* @__PURE__ */ h(Box, { key: "pane", flexDirection: "column" }, /* @__PURE__ */ h(Text, null, FALLBACK_NOTICE), target === null ? /* @__PURE__ */ h(Text, { dimColor: true }, FALLBACK_READING) : /* @__PURE__ */ h(Link, { key: LINK_KEY, href: target.href, label: target.label }));
+}
+async function readFallback($, host) {
+  const read = { target: null };
+  host.fallback = read;
+  read.target = fallbackTarget(await readRooms($));
+  if (host.fallback === read) $.ui.invalidate("ui.render");
+}
+function forgetFallback(host) {
+  host.fallback = null;
+}
+async function readRooms($) {
+  let endWait = () => void 0;
+  const waited = new Promise((resolve) => {
+    endWait = resolve;
+  });
+  const timer = $.clock.after(ROOMS_READ_TIMEOUT_MS, () => {
+    endWait(null);
+  });
+  try {
+    return await Promise.race([fetchRooms($), waited]);
+  } finally {
+    timer.cancel();
+  }
+}
+async function fetchRooms($) {
+  try {
+    const answer = await $.http.fetch(ROOMS_URL, { headers: { accept: "application/json" } });
+    return await roomsOf(answer);
+  } catch (error) {
+    $.ui.log(`tokeneater fallback: the rooms read failed: ${String(error)}`, { to: "debug" });
+    return null;
+  }
+}
+
+// plugin/hooks/pane-parts.tsx
+var BUTTON_GAP = 2;
+function drawKeys($, e, host) {
+  const { Box, Button } = $.ui.resolve(e);
+  return /* @__PURE__ */ h(Box, { key: "keys", flexDirection: "row", flexWrap: "wrap", columnGap: BUTTON_GAP }, PANE_KEYS.map((key) => /* @__PURE__ */ h(
+    Button,
+    {
+      key: key.id,
+      label: key.label,
+      hotkey: key.hotkey,
+      plain: true,
+      onPress: () => {
+        void sendInput($, host, { input: key.input, surface: e.surface });
+      }
+    }
+  )));
+}
+function noticeOf(host, isTooSmall) {
+  switch (hostPhase(host)) {
+    case "idle":
+      return IDLE_NOTICE;
+    case "failed":
+      return `${host.problem ?? ""} ${RETRY_HINT}`;
+    case "restarting":
+      return RESTARTING_NOTICE;
+    case "running":
+      return isTooSmall ? TOO_SMALL_NOTICE : null;
+  }
+}
+
+// plugin/hooks/desktop-pane.tsx
+var MAP_KEY = "map";
+function drawDesktopPane($, e, host) {
+  const isDocked = e.props.placement === "dock" && e.viewport?.isFullscreen === true;
+  if (!isDocked) return drawFallback($, e, host);
+  const { Box, Text } = $.ui.resolve(e);
+  if (host.run !== null && host.run.surface !== "desktop") {
+    return /* @__PURE__ */ h(Text, null, playingElsewhereNotice(host.run.surface));
+  }
+  const { bodyColumns } = e.props;
+  const size = desktopMapSize(
+    bodyColumns,
+    e.props.scroll.bodyRows,
+    desktopControlRows(bodyColumns)
+  );
+  const notice = noticeOf(host, size === null);
+  if (size === null || notice !== null) {
+    return /* @__PURE__ */ h(Box, { key: "pane", flexDirection: "column" }, /* @__PURE__ */ h(Text, null, notice ?? TOO_SMALL_NOTICE), drawKeys($, e, host));
+  }
+  mountPane($, host, size);
+  return drawDesktopGame($, e, { host, size });
+}
+function drawDesktopGame($, e, { host, size }) {
+  const { Box, Text, Svg, Client } = $.ui.resolve(e);
+  const hud = host.lastHud;
+  return /* @__PURE__ */ h(Box, { key: "pane", flexDirection: "column" }, /* @__PURE__ */ h(
+    Client,
+    {
+      key: MAP_KEY,
+      module: "./map-surface.js",
+      width: size.columns,
+      height: size.rows,
+      props: host.lastMap
+    }
+  ), /* @__PURE__ */ h(Box, { key: "hud", height: DESKTOP_HUD_ROWS, flexShrink: 0 }, hud !== null && /* @__PURE__ */ h(Svg, { source: hud.svg, alt: hud.alt, width: hud.w, height: hud.h })), drawKeys($, e, host), /* @__PURE__ */ h(Text, { dimColor: true }, DESKTOP_KEY_HINT));
+}
+
 // plugin/hooks/pane.tsx
 var INPUT_KEY = "input";
-var BUTTON_GAP = 2;
 function drawPane($, e, host) {
-  if (e.surface !== "terminal") {
-    const { Text: Text2 } = $.ui.resolve(e);
-    return /* @__PURE__ */ h(Text2, null, SURFACE_NOTICE);
-  }
+  if (e.surface === "desktop") return drawDesktopPane($, e, host);
+  if (e.surface !== "terminal") return drawFallback($, e, host);
   const { Box, Text } = $.ui.resolve(e);
   if (e.props.placement === "inline") return /* @__PURE__ */ h(Text, null, DOCK_NOTICE);
+  if (host.run !== null && host.run.surface !== "terminal") {
+    return /* @__PURE__ */ h(Text, null, playingElsewhereNotice(host.run.surface));
+  }
   const size = rasterSize(e.props.bodyColumns, e.props.scroll.bodyRows);
   const notice = noticeOf(host, size === null);
   if (size === null || notice !== null) {
@@ -637,32 +1109,10 @@ function drawGame($, e, { host, size }) {
     }
   ))), drawKeys($, e, host));
 }
-function drawKeys($, e, host) {
-  const { Box, Button } = $.ui.resolve(e);
-  return /* @__PURE__ */ h(Box, { key: "keys", flexDirection: "row", flexWrap: "wrap", columnGap: BUTTON_GAP }, PANE_KEYS.map((key) => /* @__PURE__ */ h(
-    Button,
-    {
-      key: key.id,
-      label: key.label,
-      hotkey: key.hotkey,
-      plain: true,
-      onPress: () => {
-        void sendInput($, host, key.input);
-      }
-    }
-  )));
-}
-function noticeOf(host, isTooSmall) {
-  switch (hostPhase(host)) {
-    case "idle":
-      return IDLE_NOTICE;
-    case "failed":
-      return `${host.problem ?? ""} ${RETRY_HINT}`;
-    case "restarting":
-      return RESTARTING_NOTICE;
-    case "running":
-      return isTooSmall ? TOO_SMALL_NOTICE : null;
-  }
+
+// src/mod-log.ts
+function surfaceLog(surface, isDocked) {
+  return `tokeneater.surface ${surface ?? "none"} ${isDocked ? "dock" : "inline"}`;
 }
 
 // plugin/hooks/pane-hooks.ts
@@ -671,40 +1121,61 @@ function measureScreen(mod, viewport) {
   if (viewport?.isFullscreen === void 0) return;
   mod.screen = { columns: viewport.columns, isFullscreen: viewport.isFullscreen };
 }
+function measureDesktop(mod, viewport) {
+  if (viewport?.isFullscreen === void 0) return;
+  mod.desktopDocks = viewport.isFullscreen;
+}
+function forgetDesktop(mod) {
+  mod.desktopDocks = null;
+}
 async function openOnSubmit($, mod, e) {
   const isMidTurn = e.turnId !== void 0;
   if (!isMidTurn) await $.state.set(CLOSED_THIS_TURN, false);
   if (!mod.host.options.isAutoOpenOn) return;
   const { value: wasClosedThisTurn = false } = await $.state.get(CLOSED_THIS_TURN);
+  const surface = await surfaceOf($, mod);
   const facts = {
     isAutoOpenOn: mod.host.options.isAutoOpenOn,
     originKind: e.origin.kind,
     isMidTurn,
     wasClosedThisTurn,
-    screen: mod.screen
+    surface,
+    screen: mod.screen,
+    desktopDocks: mod.desktopDocks
   };
-  if (!shouldAutoOpen({ ...facts, isOpen: await isPaneOpen($) })) return;
+  if (surface === null || !shouldAutoOpen({ ...facts, isOpen: await isPaneOpen($) })) return;
   const opened = await $.ui.open({ id: PANE_ID, title: PANE_TITLE, columns: PANE_COLUMNS });
-  if (opened.isPlaced) void startBridge($, mod.host);
+  $.ui.log(surfaceLog(surface, opened.isPlaced), { to: "debug" });
+  if (opened.isPlaced) void startBridge($, mod.host, surface);
 }
-async function togglePane($, host, e) {
+async function togglePane($, mod, e) {
+  const { host } = mod;
   if (await isPaneOpen($)) {
     await $.state.set(CLOSED_THIS_TURN, true);
     await $.ui.close({ id: PANE_ID });
     return { text: CLOSED_TEXT };
   }
-  const isDocked = isDockable(e.presentation);
+  const surface = await surfaceOf($, mod);
+  const isDocked = isDockedOn(mod, surface, e);
   await $.ui.open({
     id: PANE_ID,
     title: PANE_TITLE,
     columns: PANE_COLUMNS,
     ...isDocked ? { focus: true } : {}
   });
-  if (!isDocked) return { text: DOCK_NOTICE };
-  await startBridge($, host);
+  $.ui.log(surfaceLog(surface, isDocked), { to: "debug" });
+  if (surface === null || !isDocked) {
+    return { text: surface === "terminal" ? DOCK_NOTICE : FALLBACK_OPENED_TEXT };
+  }
+  await startBridge($, host, surface);
   return { text: OPENED_TEXT };
 }
+function isDockedOn(mod, surface, e) {
+  if (surface === "desktop") return mod.desktopDocks === true;
+  return surface === "terminal" && isDockable(e.presentation);
+}
 async function paneClosed($, host, e) {
+  forgetFallback(host);
   if (e.origin.kind === "person") await $.state.set(CLOSED_THIS_TURN, true);
   await stopBridge($, host);
 }
@@ -712,20 +1183,36 @@ async function turnEnded($, host, e) {
   await $.state.set(CLOSED_THIS_TURN, false);
   if (!e.isAborted && await isPaneOpen($)) $.ui.toast(turnToast(hostStatus(host)));
 }
+async function surfaceOf($, mod) {
+  return playSurface(await $.session.surfaces(), mod.desktopDocks);
+}
 async function isPaneOpen($) {
   return (await $.ui.panes()).some((pane) => pane.id === PANE_ID);
 }
 
 // plugin/hooks/register.tsx
 function register(on, options) {
-  const mod = { host: createBridgeHost(readOptions(options)), screen: null };
+  const mod = {
+    host: createBridgeHost(readOptions(options)),
+    screen: null,
+    desktopDocks: null
+  };
   const { host } = mod;
   on("session.start", async ($, e, next) => {
     await $.command.register({ name: PANE_ID, description: COMMAND_DESCRIPTION, immediate: true });
     return next(e);
   });
+  on("session.attach", { surface: "desktop" }, ($, e, next) => {
+    measureDesktop(mod, e.viewport);
+    return next(e);
+  });
+  on("session.detach", { surface: "desktop" }, ($, e, next) => {
+    forgetDesktop(mod);
+    return next(e);
+  });
   on("ui.render", { component: "PromptHint" }, ($, e, next) => {
     if (e.surface === "terminal") measureScreen(mod, e.viewport);
+    if (e.surface === "desktop") measureDesktop(mod, e.viewport);
     return next(e);
   });
   on("prompt.submit", async ($, e, next) => {
@@ -733,19 +1220,26 @@ function register(on, options) {
     if (entered.drop === void 0) await openOnSubmit($, mod, e);
     return entered;
   });
-  on("command.run", { command: "tokeneater" }, ($, e) => togglePane($, host, e));
+  on("command.run", { command: "tokeneater" }, ($, e) => togglePane($, mod, e));
   on("ui.close", async ($, e, next) => {
     if (e.id === PANE_ID) await paneClosed($, host, e);
     return next(e);
   });
   on("ui.render", { component: "Pane", requestId: "tokeneater" }, ($, e) => {
     if (e.surface === "terminal") measureScreen(mod, e.viewport);
+    if (e.surface === "desktop") measureDesktop(mod, e.viewport);
     return drawPane($, e, host);
   });
   on("ui.message", async ($, e, next) => {
-    const message = e.requestId === PANE_ID ? parseSurfaceMessage(e.data) : null;
-    if (message !== null) await forwardMessage($, host, message);
-    return next(e);
+    const isPane = e.requestId === PANE_ID;
+    const message = isPane ? parseSurfaceMessage(e.data) : null;
+    const surface = playSurfaceOf(e.surface);
+    if (message !== null && surface !== null) {
+      await forwardMessage($, host, { input: message, surface });
+    }
+    const answer = await next(e);
+    const props = isPane && e.element === MAP_KEY ? handOutMap(host) : void 0;
+    return props === void 0 ? answer : { ...answer, props };
   });
   on("turn.complete", async ($, e, next) => {
     if (e.agentId === void 0) await turnEnded($, host, e);

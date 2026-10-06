@@ -2044,6 +2044,10 @@ var DESIGN_COLOURS = {
   text: "#E6EDF7",
   muted: "#8A96AB"
 };
+var DESIGN_FONTS = {
+  ui: "'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif",
+  mono: "'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace"
+};
 var GRID_SPACING = 50;
 var BLOB_RADIUS = massToRadius(EJECT_BLOB_MASS);
 function mixColours(from, to, amount) {
@@ -2286,6 +2290,55 @@ function leaderboardModel(state) {
   return { top, ownBelow };
 }
 
+// ../../packages/shared/src/client/state/minimap-marks.ts
+var PERCENT = 100;
+function slotMarks(slots, mapSize) {
+  if (slots === null) return [];
+  const toPercent = (value) => value / mapSize * PERCENT;
+  return slots.slots.map((slot) => ({
+    id: slot.id,
+    left: toPercent(slot.x),
+    top: toPercent(slot.y),
+    width: toPercent(slot.w),
+    height: toPercent(slot.h),
+    ink: slot.sponsor === null ? null : slotInk(slot.sponsor.colour, DESIGN_COLOURS.background)
+  }));
+}
+function minimapMarks(state) {
+  const latest = state.snapshots.latest();
+  if (latest === void 0) return null;
+  const { snapshot } = latest;
+  const toPercent = (value) => clampPercent(value / state.mapSize * PERCENT);
+  const { centerX, centerY, halfWidth, halfHeight } = snapshot.view;
+  const left = toPercent(centerX - halfWidth);
+  const top = toPercent(centerY - halfHeight);
+  const view = {
+    left,
+    top,
+    width: toPercent(centerX + halfWidth) - left,
+    height: toPercent(centerY + halfHeight) - top
+  };
+  const centre = ownCentre(snapshot, state.ownSlot);
+  const player = centre === null ? null : { x: toPercent(centre.x), y: toPercent(centre.y) };
+  return { view, player };
+}
+function ownCentre(snapshot, slot) {
+  let weight = 0;
+  let x = 0;
+  let y = 0;
+  for (const cell of snapshot.cells) {
+    if (cell.slot !== slot) continue;
+    const cellWeight = cell.radius * cell.radius;
+    weight += cellWeight;
+    x += cell.x * cellWeight;
+    y += cell.y * cellWeight;
+  }
+  return weight === 0 ? null : { x: x / weight, y: y / weight };
+}
+function clampPercent(value) {
+  return Math.min(Math.max(value, 0), PERCENT);
+}
+
 // ../../packages/shared/src/client/state/play-again.ts
 var PlayAgain = class {
   constructor(connection) {
@@ -2364,6 +2417,16 @@ function paneViewport(size) {
 function panePoint(size, x, y) {
   const { widthPx, heightPx } = paneViewport(size);
   return { xPx: (x + 1) / 2 * widthPx, yPx: (y + 1) / 2 * heightPx };
+}
+function headingPoint(size, heading) {
+  const { widthPx, heightPx } = paneViewport(size);
+  const centre = { xPx: widthPx / 2, yPx: heightPx / 2 };
+  if (heading === null) return centre;
+  const reachPx = Math.min(reachAlong(heading.x, centre.xPx), reachAlong(heading.y, centre.yPx));
+  return { xPx: centre.xPx + heading.x * reachPx, yPx: centre.yPx + heading.y * reachPx };
+}
+function reachAlong(component, halfPx) {
+  return component === 0 ? Number.POSITIVE_INFINITY : halfPx / Math.abs(component);
 }
 function isCount2(value, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= max;
@@ -2557,12 +2620,14 @@ function end(response, status, text) {
 
 // bridge/env.ts
 var DEFAULT_SERVER_URL = "https://playtokeneater.com";
+var BRIDGE_SURFACES = ["terminal", "desktop"];
 var BRIDGE_ENV = {
   serverUrl: "TE_SERVER_URL",
   nickname: "TE_NICKNAME",
   room: "TE_ROOM",
   columns: "TE_COLUMNS",
-  rows: "TE_ROWS"
+  rows: "TE_ROWS",
+  surface: "TE_SURFACE"
 };
 function parseBridgeEnv(env) {
   const serverUrl = env[BRIDGE_ENV.serverUrl] ?? "";
@@ -2580,6 +2645,13 @@ function parseBridgeEnv(env) {
       error: `${BRIDGE_ENV.columns} and ${BRIDGE_ENV.rows} must be a pane size (1-512 \xD7 1-256)`
     };
   }
+  const surface = parseSurface(env[BRIDGE_ENV.surface] ?? "");
+  if (surface === null) {
+    return {
+      ok: false,
+      error: `${BRIDGE_ENV.surface} must be one of: ${BRIDGE_SURFACES.join(", ")}`
+    };
+  }
   const room = env[BRIDGE_ENV.room] ?? "";
   return {
     ok: true,
@@ -2588,9 +2660,14 @@ function parseBridgeEnv(env) {
       server: { protocol: server.protocol, host: server.host },
       nickname: env[BRIDGE_ENV.nickname] ?? "",
       room: room === "" ? null : room,
-      size
+      size,
+      surface
     }
   };
+}
+function parseSurface(text) {
+  if (text === "") return BRIDGE_SURFACES[0];
+  return BRIDGE_SURFACES.find((surface) => surface === text) ?? null;
 }
 function parseServerUrl(text) {
   let url;
@@ -2611,38 +2688,6 @@ function parseSize(columnsText, rowsText) {
 function parseCount(text, fallback) {
   if (text === void 0) return fallback;
   return /^\d+$/.test(text) ? Number(text) : Number.NaN;
-}
-
-// bridge/lifecycle.ts
-var PARENT_CHECK_MS = 1e3;
-function watchLifecycle(host, onEnd) {
-  let timer;
-  const stops = [];
-  const stop = () => {
-    host.timers.clearTimeout(timer);
-    for (const unsubscribe of stops) unsubscribe();
-  };
-  const end2 = (reason) => {
-    stop();
-    onEnd(reason);
-  };
-  const checkParent = () => {
-    if (!host.isParentAlive()) {
-      end2("parentGone");
-      return;
-    }
-    timer = host.timers.setTimeout(checkParent, PARENT_CHECK_MS);
-  };
-  stops.push(
-    host.onSignal(() => {
-      end2("signal");
-    }),
-    host.onOutputError(() => {
-      end2("outputClosed");
-    })
-  );
-  timer = host.timers.setTimeout(checkParent, PARENT_CHECK_MS);
-  return stop;
 }
 
 // bridge/cells.ts
@@ -2787,66 +2832,85 @@ var LastFrame = class {
   }
 };
 
-// bridge/frame-pacer.ts
-var MAX_FPS = 30;
-var MIN_FPS = 15;
-var BYTE_BUDGET_PER_SECOND = 5e5;
-var BYTES_PER_CHANGED_CELL = 25;
-function frameIntervalMs(changedCells) {
-  const budgetMs = changedCells * BYTES_PER_CHANGED_CELL / BYTE_BUDGET_PER_SECOND * 1e3;
-  return Math.min(Math.max(budgetMs, 1e3 / MAX_FPS), 1e3 / MIN_FPS);
-}
-var FramePacer = class {
-  constructor(options) {
-    this.options = options;
-  }
-  options;
-  nextAt = Number.NEGATIVE_INFINITY;
-  timer = null;
-  isStopped = false;
-  /** The view may have changed: draws now, or once the interval since the last frame is over. */
-  request() {
-    if (this.isStopped || this.timer !== null) return;
-    const wait = this.nextAt - this.options.now();
-    if (wait <= 0) {
-      this.draw();
-      return;
-    }
-    this.timer = this.options.timers.setTimeout(() => {
-      this.timer = null;
-      this.draw();
-    }, wait);
-  }
-  /** Draws nothing more; a frame waiting is dropped. */
-  stop() {
-    this.isStopped = true;
-    this.options.timers.clearTimeout(this.timer);
-    this.timer = null;
-  }
-  draw() {
-    const changed = this.options.draw();
-    if (changed === 0) return;
-    this.nextAt = this.options.now() + frameIntervalMs(changed);
-  }
-};
-
-// bridge/status.ts
-function bridgeStatus(state, frame, origin) {
-  const { room } = state;
+// bridge/map-rows.ts
+var MAP_TREE_BUDGET = { nodes: 16e3, chars: 8e4 };
+var HALF = "50%";
+function mapTree(rows) {
   return {
-    phase: state.phase.kind,
-    room,
-    link: room === null ? null : roomLink(origin, room),
-    players: state.players.filter((player) => player !== void 0).length,
-    mass: state.ownMass,
-    rank: state.ownRank,
-    isDead: state.death !== null,
-    position: frame.ownCount > 0 ? { x: Math.round(frame.ownCenterX), y: Math.round(frame.ownCenterY) } : null
+    type: "Box",
+    props: {
+      flexDirection: "column",
+      width: rows.columns,
+      height: rows.rows,
+      backgroundColor: colourOf(rows.palette, 0),
+      overflow: "hidden"
+    },
+    children: rows.lines.map((line) => lineElement(line, rows.palette))
   };
 }
-var MOTION_REPORT_INTERVAL_MS = 500;
-function isMotionOnlyChange(previous, next) {
-  return previous.phase === next.phase && previous.room === next.room && previous.link === next.link && previous.players === next.players && previous.rank === next.rank && previous.isDead === next.isDead;
+function lineElement(line, palette) {
+  if (typeof line === "number") return { type: "Box", props: { height: line } };
+  return {
+    type: "Box",
+    props: { flexDirection: "row", height: 1 },
+    children: line.map((segment) => segmentElement(segment, palette))
+  };
+}
+function segmentElement(segment, palette) {
+  const place = placeOf(segment);
+  if (segment.length === 3) {
+    return { type: "Box", props: { ...place, backgroundColor: colourOf(palette, segment[2]) } };
+  }
+  if (segment.length === 4) {
+    return {
+      type: "Box",
+      props: { ...place, height: 1, flexDirection: "column" },
+      children: [halfElement(segment[2], palette), halfElement(segment[3], palette)]
+    };
+  }
+  const [, , background, ink, text] = segment;
+  return {
+    type: "Box",
+    props: { ...place, ...backgroundOf(background, palette), overflow: "hidden" },
+    children: [{ type: "Text", props: { color: colourOf(palette, ink) }, children: [text] }]
+  };
+}
+function mapTreeCost(rows) {
+  const lines = rows.lines.map((line) => lineCost(line, rows.palette));
+  const root = mapTree({ ...rows, lines: [] });
+  let chars = JSON.stringify(root).length + Math.max(lines.length - 1, 0);
+  let nodes = 1;
+  for (const line of lines) {
+    chars += line.chars;
+    nodes += line.nodes;
+  }
+  return { nodes, chars };
+}
+function lineCost(line, palette) {
+  const element = lineElement(line, palette);
+  return { nodes: countNodes(element), chars: JSON.stringify(element).length };
+}
+function placeOf(segment) {
+  const [margin, width] = segment;
+  return margin > 0 ? { marginLeft: margin, width } : { width };
+}
+function halfElement(colour, palette) {
+  return { type: "Box", props: { height: HALF, ...backgroundOf(colour, palette) } };
+}
+function backgroundOf(colour, palette) {
+  return colour === 0 ? {} : { backgroundColor: colourOf(palette, colour) };
+}
+function colourOf(palette, colour) {
+  const css = palette[colour];
+  if (css === void 0)
+    throw new Error(`tokeneater bridge: map colour ${String(colour)} is not in the palette`);
+  return css;
+}
+function countNodes(element) {
+  if (typeof element === "string") return 1;
+  let nodes = 1;
+  for (const child of element.children ?? []) nodes += countNodes(child);
+  return nodes;
 }
 
 // bridge/terminal-colours.ts
@@ -2923,6 +2987,165 @@ function inkOn(fill) {
   const onText = contrast(fillLuminance, luminance(PANE_COLOURS.text));
   const onDark = contrast(fillLuminance, luminance(PANE_COLOURS.map));
   return onText >= onDark ? PANE_COLOURS.text : PANE_COLOURS.map;
+}
+
+// bridge/cell-rows.ts
+var BOX_DRAWING_FIRST = 9472;
+var BOX_DRAWING_LAST = 9599;
+function cellRows(cells, size) {
+  const runs = [];
+  for (let row = 0; row < size.rows; row += 1) runs.push(rowRuns(cells, size.columns, row));
+  const palette = new Palette();
+  const whole = buildRows({ size, palette, runs }, Number.POSITIVE_INFINITY);
+  if (fits(mapTreeCost(whole))) return whole;
+  const frame = { size, palette, runs: runs.map(withoutDots) };
+  const undotted = buildRows(frame, Number.POSITIVE_INFINITY);
+  if (fits(mapTreeCost(undotted))) return undotted;
+  return buildRows(frame, largestFittingCap(frame));
+}
+function withoutDots(row) {
+  const kept = [];
+  for (const run of row) {
+    const last = kept.at(-1);
+    const fill = isDot(run) ? { kind: "fill", width: 1, colour: underDot(run, last) } : run;
+    if (fill.kind === "fill" && last?.kind === "fill" && last.colour === fill.colour) {
+      last.width += fill.width;
+    } else {
+      kept.push(fill.kind === "fill" ? { ...fill } : fill);
+    }
+  }
+  return kept;
+}
+function underDot(dot2, left) {
+  const surface = surfaceOf(left);
+  if (dot2.kind !== "split") return surface;
+  return dot2.top === surface || dot2.bottom === surface ? surface : dot2.bottom;
+}
+function surfaceOf(run) {
+  switch (run?.kind) {
+    case "fill":
+      return run.colour;
+    case "split":
+      return run.bottom;
+    case "text":
+      return run.background;
+    case void 0:
+      return PANE_COLOURS.map;
+  }
+}
+function isDot(run) {
+  if (run.kind === "text" || run.width > 1) return false;
+  return run.kind === "split" || run.colour !== PANE_COLOURS.map;
+}
+function fits(cost) {
+  return cost.nodes <= MAP_TREE_BUDGET.nodes && cost.chars <= MAP_TREE_BUDGET.chars;
+}
+function largestFittingCap(frame) {
+  let fitting = 0;
+  let over = Math.max(...frame.runs.map((row) => row.length));
+  while (over - fitting > 1) {
+    const cap = Math.floor((fitting + over) / 2);
+    if (fits(mapTreeCost(buildRows(frame, cap)))) fitting = cap;
+    else over = cap;
+  }
+  return fitting;
+}
+function buildRows(frame, cap) {
+  const { size, palette } = frame;
+  const lines = [];
+  for (const row of frame.runs) {
+    const segments = segmentsOf(row, palette, cap);
+    const last = lines.at(-1);
+    if (segments.length > 0) lines.push(segments);
+    else if (typeof last === "number") lines[lines.length - 1] = last + 1;
+    else lines.push(1);
+  }
+  return { columns: size.columns, rows: size.rows, palette: palette.colours(), lines };
+}
+function segmentsOf(row, palette, cap) {
+  const segments = [];
+  let margin = 0;
+  for (const run of row) {
+    if (segments.length >= cap) break;
+    if (run.kind === "fill" && run.colour === PANE_COLOURS.map) {
+      margin += run.width;
+      continue;
+    }
+    segments.push(segmentOf(run, margin, palette));
+    margin = 0;
+  }
+  return segments;
+}
+function segmentOf(run, margin, palette) {
+  switch (run.kind) {
+    case "fill":
+      return [margin, run.width, palette.indexOf(run.colour)];
+    case "split":
+      return [margin, run.width, palette.indexOf(run.top), palette.indexOf(run.bottom)];
+    case "text":
+      return [
+        margin,
+        run.width,
+        palette.indexOf(run.background),
+        palette.indexOf(run.ink),
+        run.text.trimEnd()
+      ];
+  }
+}
+function rowRuns(cells, columns, row) {
+  const runs = [];
+  const start2 = row * columns * WORDS_PER_CELL;
+  const cell = { glyph: SPACE, foreground: 0 };
+  let word = 0;
+  for (const value of cells.subarray(start2, start2 + columns * WORDS_PER_CELL)) {
+    if (word === 0) cell.glyph = value;
+    else if (word === 1) cell.foreground = value;
+    else addCell(runs, cell.glyph, { foreground: cell.foreground, background: value });
+    word = (word + 1) % WORDS_PER_CELL;
+  }
+  return runs;
+}
+function addCell(runs, glyph, colours) {
+  const { foreground, background } = colours;
+  const last = runs.at(-1);
+  if (glyph === UPPER_HALF_BLOCK && foreground !== background) {
+    if (last?.kind === "split" && last.top === foreground && last.bottom === background) {
+      last.width += 1;
+    } else runs.push({ kind: "split", width: 1, top: foreground, bottom: background });
+  } else if (glyph === SPACE || glyph === UPPER_HALF_BLOCK || isBoxDrawing(glyph)) {
+    if (last?.kind === "text" && last.background === background) {
+      last.width += 1;
+      last.text += " ";
+    } else if (last?.kind === "fill" && last.colour === background) last.width += 1;
+    else runs.push({ kind: "fill", width: 1, colour: background });
+  } else {
+    const text = String.fromCharCode(glyph);
+    if (last?.kind === "text" && last.background === background && last.ink === foreground) {
+      last.width += 1;
+      last.text += text;
+    } else runs.push({ kind: "text", width: 1, background, ink: foreground, text });
+  }
+}
+function isBoxDrawing(glyph) {
+  return glyph >= BOX_DRAWING_FIRST && glyph <= BOX_DRAWING_LAST;
+}
+var Palette = class {
+  indexes = /* @__PURE__ */ new Map([[PANE_COLOURS.map, 0]]);
+  indexOf(colour) {
+    const known = this.indexes.get(colour);
+    if (known !== void 0) return known;
+    const index = this.indexes.size;
+    this.indexes.set(colour, index);
+    return index;
+  }
+  colours() {
+    return [...this.indexes.keys()].map(cssColour);
+  }
+};
+function cssColour(colour) {
+  const hex = colour.toString(16).padStart(6, "0");
+  const isShort = hex.charAt(0) === hex.charAt(1) && hex.charAt(2) === hex.charAt(3) && hex.charAt(4) === hex.charAt(5);
+  return isShort ? `#${hex.charAt(0)}${hex.charAt(2)}${hex.charAt(4)}` : `#${hex}`;
 }
 
 // bridge/slot-layer.ts
@@ -3396,42 +3619,30 @@ var HalfBlockCanvas = class {
   }
 };
 
-// bridge/hud-layout.ts
-var HUD_MARGIN_COLUMNS = 1;
-var RANKING_TOP_ROWS = 5;
-var RANKING_MAX_HEIGHT = RANKING_TOP_ROWS + 3;
-var RANKING_COLUMNS = 26;
-var RANKING_MIN_COLUMNS = 18;
-var RANKING_MAX_SHARE = 0.4;
-var RANKING_MIN_MAP_ROWS = 2 * RANKING_MAX_HEIGHT;
-var MINIMAP_MAX_SIDE = 24;
-var MINIMAP_MIN_SIDE = 10;
-var MINIMAP_MAX_SHARE = 0.25;
-var BORDER = 1;
-function hudLayout(size) {
-  const rows = mapRows(size);
-  const rankingWidth = Math.min(RANKING_COLUMNS, Math.floor(size.columns * RANKING_MAX_SHARE));
-  const hasRanking = rankingWidth >= RANKING_MIN_COLUMNS && rows >= RANKING_MIN_MAP_ROWS;
-  const ranking = hasRanking ? { left: size.columns - HUD_MARGIN_COLUMNS - rankingWidth, width: rankingWidth } : null;
-  const freeRows = rows - (hasRanking ? RANKING_MAX_HEIGHT + 1 : 0);
-  const side = evenFloor(
-    Math.min(
-      MINIMAP_MAX_SIDE,
-      Math.floor(size.columns * MINIMAP_MAX_SHARE) - 2 * BORDER,
-      (freeRows - 2 * BORDER) * 2
-    )
-  );
-  if (side < MINIMAP_MIN_SIDE) return { ranking, minimap: null };
-  const width = side + 2 * BORDER;
-  const height = side / 2 + 2 * BORDER;
-  return {
-    ranking,
-    minimap: { left: size.columns - HUD_MARGIN_COLUMNS - width, top: rows - height, width, height }
-  };
-}
-function evenFloor(value) {
-  return Math.floor(value / 2) * 2;
-}
+// bridge/pane-map.ts
+var PaneMap = class {
+  canvas = new HalfBlockCanvas();
+  painter = new MapPainter();
+  labels = new CellLabels();
+  /** Draws the map of `scene` into `grid`, already sized to the pane's `size`. */
+  draw(grid, scene, size) {
+    const { canvas, painter } = this;
+    const { state, camera } = scene;
+    const rows = mapRows(size);
+    canvas.resize(size.columns, rows * PIXELS_PER_ROW);
+    painter.paint(canvas, {
+      camera,
+      frame: scene.frame,
+      mapSize: state.mapSize,
+      pellets: state.pellets,
+      players: state.players,
+      slots: state.slots
+    });
+    canvas.composeInto(grid);
+    painter.slotLayer.write(grid, rows, painter.pelletPixels);
+    this.labels.write(grid, { camera, players: state.players, mapRows: rows }, painter.cells);
+  }
+};
 
 // bridge/death-credit.ts
 var CREDIT_TEXT = {
@@ -3731,6 +3942,185 @@ function drawBorder(grid, box) {
   grid.paint(grid.indexOf(right, bottom), BOX.bottomRight, colours);
 }
 
+// bridge/svg-parts/markup.ts
+function num(value) {
+  return String(Math.round(value * 100) / 100);
+}
+var XML_FORBIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
+var XML_REPLACEMENT = "?";
+function escapeXml(text) {
+  return text.replace(XML_FORBIDDEN, XML_REPLACEMENT).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+}
+function svgElement(tag, attributes, content) {
+  let written = `<${tag}`;
+  for (const [name, value] of Object.entries(attributes)) {
+    written += ` ${name}="${typeof value === "number" ? num(value) : escapeXml(value)}"`;
+  }
+  return content === void 0 ? `${written}/>` : `${written}>${content}</${tag}>`;
+}
+
+// bridge/svg-parts/panel.ts
+var PANEL_STYLE = { radius: 12, opacity: 0.8 };
+var PANEL_BORDER_PX = 1;
+function panelElement(box) {
+  const inset = PANEL_BORDER_PX / 2;
+  return svgElement("rect", {
+    x: box.x + inset,
+    y: box.y + inset,
+    width: box.width - PANEL_BORDER_PX,
+    height: box.height - PANEL_BORDER_PX,
+    rx: PANEL_STYLE.radius - inset,
+    fill: DESIGN_COLOURS.surface,
+    "fill-opacity": PANEL_STYLE.opacity,
+    stroke: DESIGN_COLOURS.border,
+    "stroke-width": PANEL_BORDER_PX
+  });
+}
+
+// bridge/svg-parts/minimap.ts
+var MINIMAP_STYLE = {
+  side: 160,
+  /** The grid's lines: the border colour at 55%. */
+  gridOpacity: 0.55,
+  /** A sponsor's slot in its ink at 70%; an empty slot muted at 25%; corners of 1 px. */
+  slotOpacity: 0.7,
+  emptySlotOpacity: 0.25,
+  slotRadius: 1,
+  /** The grid's lines and the view's edge (px). */
+  lineWidth: 1,
+  /** The view: a text-coloured edge at 55% around a 6% fill, corners of 2 px. */
+  viewEdgeOpacity: 0.55,
+  viewFillOpacity: 0.06,
+  viewRadius: 2,
+  /** The player's dot (8 px across) and its glow (`--glow-dot`: 8 px of text at 45%). */
+  dotRadius: 4,
+  glowBlur: 4,
+  glowOpacity: 0.45
+};
+var GRID_STEPS = [0.25, 0.5, 0.75, 1];
+var IDS = { clip: "te-minimap-clip", glow: "te-minimap-glow" };
+function minimapSvg(view, at) {
+  const style = MINIMAP_STYLE;
+  const inner = {
+    x: at.x + PANEL_BORDER_PX,
+    y: at.y + PANEL_BORDER_PX,
+    side: style.side - 2 * PANEL_BORDER_PX
+  };
+  const place = (percent, origin) => origin + percent / 100 * inner.side;
+  const size = (percent) => percent / 100 * inner.side;
+  let marks = "";
+  for (const step2 of GRID_STEPS) {
+    const offset = step2 * inner.side;
+    const line = { fill: DESIGN_COLOURS.border, "fill-opacity": style.gridOpacity };
+    marks += svgElement("rect", {
+      x: inner.x + offset - style.lineWidth,
+      y: inner.y,
+      width: style.lineWidth,
+      height: inner.side,
+      ...line
+    });
+    marks += svgElement("rect", {
+      x: inner.x,
+      y: inner.y + offset - style.lineWidth,
+      width: inner.side,
+      height: style.lineWidth,
+      ...line
+    });
+  }
+  for (const slot of view.slots) {
+    marks += svgElement("rect", {
+      x: place(slot.left, inner.x),
+      y: place(slot.top, inner.y),
+      width: size(slot.width),
+      height: size(slot.height),
+      rx: style.slotRadius,
+      fill: slot.ink ?? DESIGN_COLOURS.muted,
+      "fill-opacity": slot.ink === null ? style.emptySlotOpacity : style.slotOpacity
+    });
+  }
+  if (view.marks !== null) marks += markSvg(view.marks, { place, size, inner });
+  const clip = svgElement(
+    "clipPath",
+    { id: IDS.clip },
+    svgElement("rect", { ...squareOf(inner), rx: PANEL_STYLE.radius - PANEL_BORDER_PX })
+  );
+  return panelElement({ x: at.x, y: at.y, width: style.side, height: style.side }) + svgElement("defs", {}, clip + glowFilter()) + svgElement("g", { "clip-path": `url(#${IDS.clip})` }, marks);
+}
+function markSvg(marks, square) {
+  const style = MINIMAP_STYLE;
+  const { place, size, inner } = square;
+  let written = svgElement("rect", {
+    // The edge's stroke runs half a line in, so the whole edge lies inside the view's box.
+    x: place(marks.view.left, inner.x) + style.lineWidth / 2,
+    y: place(marks.view.top, inner.y) + style.lineWidth / 2,
+    width: Math.max(size(marks.view.width) - style.lineWidth, 0),
+    height: Math.max(size(marks.view.height) - style.lineWidth, 0),
+    rx: style.viewRadius,
+    fill: DESIGN_COLOURS.text,
+    "fill-opacity": style.viewFillOpacity,
+    stroke: DESIGN_COLOURS.text,
+    "stroke-opacity": style.viewEdgeOpacity
+  });
+  if (marks.player === null) return written;
+  const centre = { cx: place(marks.player.x, inner.x), cy: place(marks.player.y, inner.y) };
+  written += svgElement("circle", {
+    ...centre,
+    r: style.dotRadius,
+    fill: DESIGN_COLOURS.text,
+    "fill-opacity": style.glowOpacity,
+    filter: `url(#${IDS.glow})`
+  });
+  written += svgElement("circle", { ...centre, r: style.dotRadius, fill: DESIGN_COLOURS.primary });
+  return written;
+}
+function glowFilter() {
+  return svgElement(
+    "filter",
+    { id: IDS.glow, x: -2, y: -2, width: 5, height: 5 },
+    svgElement("feGaussianBlur", { stdDeviation: MINIMAP_STYLE.glowBlur })
+  );
+}
+function squareOf(inner) {
+  return { x: inner.x, y: inner.y, width: inner.side, height: inner.side };
+}
+
+// bridge/hud-layout.ts
+var HUD_MARGIN_COLUMNS = 1;
+var RANKING_TOP_ROWS = 5;
+var RANKING_MAX_HEIGHT = RANKING_TOP_ROWS + 3;
+var RANKING_COLUMNS = 26;
+var RANKING_MIN_COLUMNS = 18;
+var RANKING_MAX_SHARE = 0.4;
+var RANKING_MIN_MAP_ROWS = 2 * RANKING_MAX_HEIGHT;
+var MINIMAP_MAX_SIDE = 24;
+var MINIMAP_MIN_SIDE = 10;
+var MINIMAP_MAX_SHARE = 0.25;
+var BORDER = 1;
+function hudLayout(size) {
+  const rows = mapRows(size);
+  const rankingWidth = Math.min(RANKING_COLUMNS, Math.floor(size.columns * RANKING_MAX_SHARE));
+  const hasRanking = rankingWidth >= RANKING_MIN_COLUMNS && rows >= RANKING_MIN_MAP_ROWS;
+  const ranking = hasRanking ? { left: size.columns - HUD_MARGIN_COLUMNS - rankingWidth, width: rankingWidth } : null;
+  const freeRows = rows - (hasRanking ? RANKING_MAX_HEIGHT + 1 : 0);
+  const side = evenFloor(
+    Math.min(
+      MINIMAP_MAX_SIDE,
+      Math.floor(size.columns * MINIMAP_MAX_SHARE) - 2 * BORDER,
+      (freeRows - 2 * BORDER) * 2
+    )
+  );
+  if (side < MINIMAP_MIN_SIDE) return { ranking, minimap: null };
+  const width = side + 2 * BORDER;
+  const height = side / 2 + 2 * BORDER;
+  return {
+    ranking,
+    minimap: { left: size.columns - HUD_MARGIN_COLUMNS - width, top: rows - height, width, height }
+  };
+}
+function evenFloor(value) {
+  return Math.floor(value / 2) * 2;
+}
+
 // bridge/hud-panel.ts
 var PANEL_VEIL = 0.8;
 function topPixelOf(grid, index) {
@@ -3774,6 +4164,667 @@ function drawPanel(grid, box, title2 = []) {
   const at = { column: box.left + 2, row: box.top, end: right - 1 };
   const end2 = grid.writeRuns(at, [{ text: " ", colour: border }, ...title2]);
   grid.writeRuns({ column: end2, row: box.top, end: right - 1 }, [{ text: " ", colour: border }]);
+}
+
+// bridge/ranking-box.ts
+var RANKING_TEXT = {
+  title: "Ranking",
+  /** A row whose slot the room has not named yet, as the web's `hud.leaderboard.unnamed`. */
+  unnamed: "Unnamed"
+};
+var RANK_COLUMNS = 3;
+var GAP = 1;
+var INSET = 2;
+var CUT_MARK2 = ".";
+var SPACE_GLYPH = 32;
+var OWN_ROW_TINT = 0.12;
+function rankingRows(model, width) {
+  return rankingLines(model).map(({ line, rank }) => rowOf(line, rank, width));
+}
+function rankingLines(model) {
+  const lines = model.top.slice(0, RANKING_TOP_ROWS).map((line) => ({ line, rank: `${String(line.rank)}.`, isBelowTop: false }));
+  const own = model.top.find((line) => line.isOwn) ?? model.ownBelow;
+  if (own !== null && own.rank > RANKING_TOP_ROWS) {
+    lines.push({ line: own, rank: `#${String(own.rank)}`, isBelowTop: true });
+  }
+  return lines;
+}
+function fitName(name, room) {
+  const glyphs = glyphsOf(name);
+  if (glyphs.length <= room) return name;
+  if (room < 2) return "";
+  let length = room - 1;
+  while (glyphs[length - 1] === SPACE_GLYPH) length -= 1;
+  return String.fromCharCode(...glyphs.slice(0, length)) + CUT_MARK2;
+}
+function drawRanking(grid, place, model) {
+  const rows = rankingRows(model, place.width);
+  if (rows.length === 0) return;
+  const { left, width } = place;
+  drawPanel(grid, { left, top: 0, width, height: rows.length + 2 }, [
+    { text: RANKING_TEXT.title, colour: PANE_COLOURS.text }
+  ]);
+  rows.forEach((row, index) => {
+    writeRow(grid, { left, width, row: index + 1 }, row);
+  });
+}
+function rowOf(line, rank, width) {
+  const mass = NUMBER_FORMAT.format(line.mass);
+  const room = width - 2 * INSET - RANK_COLUMNS - 2 * GAP - mass.length;
+  return { rank, name: fitName(line.name ?? RANKING_TEXT.unnamed, room), mass, isOwn: line.isOwn };
+}
+function writeRow(grid, at, row) {
+  const first = at.left + INSET;
+  const end2 = at.left + at.width - INSET;
+  if (row.isOwn) {
+    for (let column = at.left + 1; column < at.left + at.width - 1; column += 1) {
+      veilCell(grid, grid.indexOf(column, at.row), PANE_COLOURS.mint, OWN_ROW_TINT);
+    }
+  }
+  const label = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.muted;
+  const name = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.text;
+  grid.writeRuns({ column: first, row: at.row, end: end2 }, [{ text: row.rank, colour: label }]);
+  grid.writeRuns({ column: first + RANK_COLUMNS + GAP, row: at.row, end: end2 }, [
+    { text: row.name, colour: name }
+  ]);
+  grid.writeRuns({ column: end2 - row.mass.length, row: at.row, end: end2 }, [
+    { text: row.mass, colour: label }
+  ]);
+}
+
+// bridge/svg-parts/ranking.ts
+var RANKING_STYLE = {
+  /** The card's width on the web. */
+  width: 232,
+  paddingX: 16,
+  paddingY: 12,
+  titleSize: 14,
+  /** `font-size` × `line-height` 1.4. */
+  titleLine: 19.6,
+  titleGap: 8,
+  rowSize: 13,
+  /** `font-size` × `line-height` 1.55. */
+  rowLine: 20.15,
+  /** Above and below a row's text, inside its band (`padding: 1px …`). */
+  rowPaddingY: 1,
+  rowGap: 2,
+  /** The rank column: 2.25 em of the row's font. */
+  rankWidth: 29.25,
+  columnGap: 8,
+  /** How far the own row's band reaches past the text on each side, and its corners' radius. */
+  bandInset: 8,
+  bandRadius: 8,
+  /** The share of mint in the own row's band (`color-mix` 12%). */
+  bandOpacity: 0.12,
+  /** Above and below the line before the player's own row, and the line's thickness. */
+  belowGap: 8,
+  belowLine: 1
+};
+var ROW_HEIGHT = RANKING_STYLE.rowLine + 2 * RANKING_STYLE.rowPaddingY;
+var LEADERBOARD_TITLE = "Leaderboard";
+var MONO_ADVANCE_EM = 0.6;
+var ELLIPSIS = "\u2026";
+function rankingHeight(topRows, hasOwnBelow) {
+  const style = RANKING_STYLE;
+  const top = topRows * ROW_HEIGHT + Math.max(topRows - 1, 0) * style.rowGap;
+  const below = hasOwnBelow ? 2 * style.belowGap + style.belowLine + ROW_HEIGHT : 0;
+  const inside = 2 * style.paddingY + style.titleLine + style.titleGap + top + below;
+  return 2 * PANEL_BORDER_PX + inside;
+}
+var RANKING_MAX_HEIGHT2 = rankingHeight(5, true);
+function rankingSvg(model, at) {
+  const lines = rankingLines(model);
+  if (lines.length === 0) return "";
+  const style = RANKING_STYLE;
+  const top = lines.filter((line) => !line.isBelowTop);
+  const below = lines.find((line) => line.isBelowTop);
+  const height = rankingHeight(top.length, below !== void 0);
+  const left = at.x + PANEL_BORDER_PX + style.paddingX;
+  const textWidth2 = at.width - 2 * (PANEL_BORDER_PX + style.paddingX);
+  let y = at.y + PANEL_BORDER_PX + style.paddingY;
+  let content = svgElement(
+    "text",
+    {
+      x: left,
+      y: y + style.titleLine / 2,
+      "dominant-baseline": "central",
+      "font-family": DESIGN_FONTS.ui,
+      "font-size": style.titleSize,
+      "font-weight": 600,
+      fill: DESIGN_COLOURS.text
+    },
+    escapeXml(LEADERBOARD_TITLE)
+  );
+  y += style.titleLine + style.titleGap;
+  for (const line of top) {
+    content += rowSvg(line, { x: left, y, width: textWidth2 });
+    y += ROW_HEIGHT + style.rowGap;
+  }
+  if (below !== void 0) {
+    y += style.belowGap - style.rowGap;
+    content += svgElement("rect", {
+      x: left,
+      y,
+      width: textWidth2,
+      height: style.belowLine,
+      fill: DESIGN_COLOURS.border
+    });
+    content += rowSvg(below, {
+      x: left,
+      y: y + style.belowLine + style.belowGap,
+      width: textWidth2
+    });
+  }
+  return panelElement({ x: at.x, y: at.y, width: at.width, height }) + content;
+}
+function rowSvg({ line, rank }, at) {
+  const style = RANKING_STYLE;
+  const mass = NUMBER_FORMAT.format(line.mass);
+  const charWidth = style.rowSize * MONO_ADVANCE_EM;
+  const nameRoom = at.width - style.rankWidth - 2 * style.columnGap - mass.length * charWidth;
+  const name = fitText(line.name ?? RANKING_TEXT.unnamed, Math.floor(nameRoom / charWidth));
+  const label = line.isOwn ? DESIGN_COLOURS.primary : DESIGN_COLOURS.muted;
+  const centre = at.y + ROW_HEIGHT / 2;
+  const text = (x, fill, words, anchor = "start") => svgElement(
+    "text",
+    {
+      x,
+      y: centre,
+      "dominant-baseline": "central",
+      "text-anchor": anchor,
+      "font-family": DESIGN_FONTS.mono,
+      "font-size": style.rowSize,
+      fill
+    },
+    escapeXml(words)
+  );
+  const band = line.isOwn ? svgElement("rect", {
+    x: at.x - style.bandInset,
+    y: at.y,
+    width: at.width + 2 * style.bandInset,
+    height: ROW_HEIGHT,
+    rx: style.bandRadius,
+    fill: DESIGN_COLOURS.primary,
+    "fill-opacity": style.bandOpacity
+  }) : "";
+  return band + text(at.x, label, rank) + text(at.x + style.rankWidth + style.columnGap, line.isOwn ? label : DESIGN_COLOURS.text, name) + text(at.x + at.width, label, mass, "end");
+}
+function fitText(text, room) {
+  const characters = Array.from(text);
+  if (characters.length <= room) return text;
+  if (room < 2) return "";
+  return characters.slice(0, room - 1).join("").trimEnd() + ELLIPSIS;
+}
+
+// bridge/svg-renderer.ts
+var DESKTOP_CELL_WIDTH_PX = 8;
+var HUD_SPACING = { padding: 16, gap: 12 };
+var RANKING_MIN_WIDTH = 160;
+var HUD_HEIGHT_PX = Math.ceil(
+  2 * HUD_SPACING.padding + Math.max(RANKING_MAX_HEIGHT2, MINIMAP_STYLE.side)
+);
+function hudPlaces(width) {
+  const { padding, gap } = HUD_SPACING;
+  const room = width - 2 * padding;
+  const besideMinimap = room - MINIMAP_STYLE.side - gap;
+  if (besideMinimap >= RANKING_MIN_WIDTH) {
+    return {
+      ranking: { x: padding, y: padding, width: Math.min(besideMinimap, RANKING_STYLE.width) },
+      minimap: { x: width - padding - MINIMAP_STYLE.side, y: padding }
+    };
+  }
+  const ranking = room >= RANKING_MIN_WIDTH ? { x: padding, y: padding, width: Math.min(room, RANKING_STYLE.width) } : null;
+  return { ranking, minimap: null };
+}
+function renderSvg(scene, width) {
+  const height = HUD_HEIGHT_PX;
+  let content = svgElement("rect", { width, height, fill: DESIGN_COLOURS.background });
+  const { state } = scene;
+  if (state.phase.kind === "playing" || state.phase.kind === "reconnecting") {
+    const places = hudPlaces(width);
+    if (places.ranking !== null) content += rankingSvg(leaderboardModel(state), places.ranking);
+    if (places.minimap !== null) {
+      const view = {
+        marks: minimapMarks(state),
+        slots: slotMarks(state.slots, state.mapSize)
+      };
+      content += minimapSvg(view, places.minimap);
+    }
+  }
+  const svg = svgElement(
+    "svg",
+    {
+      xmlns: "http://www.w3.org/2000/svg",
+      width,
+      height,
+      viewBox: `0 0 ${String(width)} ${String(height)}`
+    },
+    content
+  );
+  return { svg, alt: hudAlt(scene.status), w: width, h: height };
+}
+function hudAlt(status) {
+  if (status.room === null) return "tokeneater";
+  const rank = status.rank === null ? "" : `, rank #${String(status.rank)} of ${String(status.players)}`;
+  return `tokeneater \u2014 room ${status.room}, mass ${String(status.mass)}${rank}`;
+}
+
+// bridge/desktop-renderer.ts
+var DesktopRenderer = class {
+  grid = new CellGrid();
+  map = new PaneMap();
+  lastFrame = new LastFrame();
+  /** Writes the map when a cell of it changed, and the HUD; returns the map's changed cells. */
+  draw(scene, size, output) {
+    const cells = this.render(scene, size);
+    const changed = this.lastFrame.replace(size, cells);
+    if (changed > 0) output.mapRows(cellRows(cells, size));
+    output.hud(renderSvg(scene, size.columns * DESKTOP_CELL_WIDTH_PX));
+    return changed;
+  }
+  /** The cells of the map `Client` for `scene` on a pane of `size` (rewritten by the next call). */
+  render(scene, size) {
+    const { grid } = this;
+    grid.resize(size);
+    this.map.draw(grid, scene, size);
+    drawOverlay(grid, mapRows(size), paneOverlay(scene));
+    drawStatusRow(grid, size.rows - 1, scene.status);
+    return grid.cells;
+  }
+};
+
+// bridge/lifecycle.ts
+var PARENT_CHECK_MS = 1e3;
+function watchLifecycle(host, onEnd) {
+  let timer;
+  const stops = [];
+  const stop = () => {
+    host.timers.clearTimeout(timer);
+    for (const unsubscribe of stops) unsubscribe();
+  };
+  const end2 = (reason) => {
+    stop();
+    onEnd(reason);
+  };
+  const checkParent = () => {
+    if (!host.isParentAlive()) {
+      end2("parentGone");
+      return;
+    }
+    timer = host.timers.setTimeout(checkParent, PARENT_CHECK_MS);
+  };
+  stops.push(
+    host.onSignal(() => {
+      end2("signal");
+    }),
+    host.onOutputError(() => {
+      end2("outputClosed");
+    })
+  );
+  timer = host.timers.setTimeout(checkParent, PARENT_CHECK_MS);
+  return stop;
+}
+
+// bridge/frame-pacer.ts
+var MAX_FPS = 30;
+var MIN_FPS = 15;
+var BYTE_BUDGET_PER_SECOND = 5e5;
+var BYTES_PER_CHANGED_CELL = 25;
+function frameIntervalMs(changedCells) {
+  const budgetMs = changedCells * BYTES_PER_CHANGED_CELL / BYTE_BUDGET_PER_SECOND * 1e3;
+  return Math.min(Math.max(budgetMs, 1e3 / MAX_FPS), 1e3 / MIN_FPS);
+}
+var FramePacer = class {
+  constructor(options) {
+    this.options = options;
+  }
+  options;
+  nextAt = Number.NEGATIVE_INFINITY;
+  timer = null;
+  isStopped = false;
+  /** The view may have changed: draws now, or once the interval since the last frame is over. */
+  request() {
+    if (this.isStopped || this.timer !== null) return;
+    const wait = this.nextAt - this.options.now();
+    if (wait <= 0) {
+      this.draw();
+      return;
+    }
+    this.timer = this.options.timers.setTimeout(() => {
+      this.timer = null;
+      this.draw();
+    }, wait);
+  }
+  /** Draws nothing more; a frame waiting is dropped. */
+  stop() {
+    this.isStopped = true;
+    this.options.timers.clearTimeout(this.timer);
+    this.timer = null;
+  }
+  draw() {
+    const changed = this.options.draw();
+    if (changed === 0) return;
+    this.nextAt = this.options.now() + frameIntervalMs(changed);
+  }
+};
+
+// bridge/status.ts
+function bridgeStatus(state, frame, origin) {
+  const { room } = state;
+  return {
+    phase: state.phase.kind,
+    room,
+    link: room === null ? null : roomLink(origin, room),
+    players: state.players.filter((player) => player !== void 0).length,
+    mass: state.ownMass,
+    rank: state.ownRank,
+    isDead: state.death !== null,
+    position: frame.ownCount > 0 ? { x: Math.round(frame.ownCenterX), y: Math.round(frame.ownCenterY) } : null
+  };
+}
+var MOTION_REPORT_INTERVAL_MS = 500;
+function isMotionOnlyChange(previous, next) {
+  return previous.phase === next.phase && previous.room === next.room && previous.link === next.link && previous.players === next.players && previous.rank === next.rank && previous.isDead === next.isDead;
+}
+
+// bridge/steering-wheel.ts
+var CHORD_WINDOW_MS = 150;
+var SETTLE_ANGLE_DEGREES = 5;
+var SETTLE_COSINE = Math.cos(SETTLE_ANGLE_DEGREES * Math.PI / 180);
+var PARALLEL_TOLERANCE = 1e-9;
+var SteeringWheel = class {
+  heading = null;
+  last = null;
+  /**
+   * Turns for a steering key pressed at `now` (ms) towards (`dx`, `dy`); returns the new heading,
+   * or `null` for (0, 0), which stops steering (the player comes to rest) and resets the wheel.
+   */
+  turn(dx, dy, now) {
+    const key = unitOf(dx, dy);
+    if (key === null) {
+      this.reset();
+      return null;
+    }
+    const { last } = this;
+    this.last = { key, at: now };
+    this.heading = last !== null && isChord(last, key, now) ? bisector(last.key, key) : this.nudged(key);
+    return this.heading;
+  }
+  /** Forgets the heading and the last key: the pointer aimed, so the next key steers exactly. */
+  reset() {
+    this.heading = null;
+    this.last = null;
+  }
+  /** The heading after `key` nudges the current one (see the class). */
+  nudged(key) {
+    const { heading } = this;
+    if (heading === null || dot(heading, key) < 0) return key;
+    const blended = bisector(heading, key);
+    return dot(blended, key) >= SETTLE_COSINE ? key : blended;
+  }
+};
+function isChord(last, key, now) {
+  return now - last.at <= CHORD_WINDOW_MS && Math.abs(dot(last.key, key)) < 1 - PARALLEL_TOLERANCE;
+}
+function dot(a, b) {
+  return a.x * b.x + a.y * b.y;
+}
+function bisector(a, b) {
+  const x = a.x + b.x;
+  const y = a.y + b.y;
+  const length = Math.hypot(x, y);
+  return { x: x / length, y: y / length };
+}
+function unitOf(x, y) {
+  const length = Math.hypot(x, y);
+  return length === 0 ? null : { x: x / length, y: y / length };
+}
+
+// bridge/session.ts
+var BridgeSession = class {
+  constructor(options) {
+    this.options = options;
+    const { connection, now, timers } = options;
+    this.size = options.size;
+    this.intents = createIntentControl({
+      connection,
+      aim: this.aim,
+      camera: this.camera,
+      now,
+      timers
+    });
+    this.playAgain = new PlayAgain(connection);
+    this.pacer = new FramePacer({ now, timers, draw: () => this.draw() });
+    this.stops = [
+      connection.onMessage((message) => {
+        this.receive(message);
+      }),
+      connection.onPhase((phase) => {
+        this.changePhase(phase);
+      })
+    ];
+  }
+  options;
+  state = createClientState();
+  aim = new Aim();
+  wheel = new SteeringWheel();
+  camera = new Camera();
+  frame = createFrameView();
+  own = { slot: null, target: null };
+  ownTarget = { x: 0, y: 0 };
+  view = { centerX: 0, centerY: 0, halfWidth: 0, halfHeight: 0 };
+  intents;
+  playAgain;
+  stops;
+  pacer;
+  size;
+  isStopped = false;
+  reported = null;
+  reportedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Joins the game (`connection.join`); frames and status lines follow from its first phase. A
+   * nickname the shared filter refuses never reaches the lobby: the connection is `rejected`
+   * (`nickname`) at once, whose card points to the plugin's option (`/config`).
+   */
+  start(request) {
+    this.options.connection.join(request);
+  }
+  /**
+   * Plays one control input:
+   * - `aim`: steers at that pane point, and resets the keys' `SteeringWheel`;
+   * - `keys`: turns the wheel and steers its way to the map's edge (`headingPoint`), or at the
+   *   centre for (0, 0) — only the aim changes: intents go out at their own rate, as for the pointer;
+   * - `press` `split` / `eject`: presses it (only in play, as on the web);
+   * - `press` `respawn`: Play again while dead (once until the new life shows); "try now" /
+   *   "reconnect" while the lobby is full or the connection is lost; nothing otherwise;
+   * - `resize`: draws at the new size from now on.
+   * Each asks for a frame: an aim moves the player's predicted cells, a press may change a card.
+   * Once stopped, inputs are ignored (a request already in flight when the bridge ends).
+   */
+  handle(input) {
+    if (this.isStopped) return;
+    switch (input.kind) {
+      case "aim":
+        this.wheel.reset();
+        this.aimAt(input.x, input.y);
+        break;
+      case "keys":
+        this.steerWith(input.dx, input.dy);
+        break;
+      case "press":
+        this.press(input.action);
+        break;
+      case "resize":
+        this.size = { columns: input.columns, rows: input.rows };
+    }
+    this.pacer.request();
+  }
+  /** Stops sending and drawing, leaves the room and stops listening to the connection. */
+  stop() {
+    this.isStopped = true;
+    this.pacer.stop();
+    this.intents.stop();
+    for (const stop of this.stops) stop();
+    this.options.connection.leave();
+  }
+  aimAt(x, y) {
+    const point = panePoint(this.size, x, y);
+    this.intents.sink.aimAt(point.xPx, point.yPx);
+  }
+  steerWith(dx, dy) {
+    const heading = this.wheel.turn(dx, dy, this.options.now());
+    const point = headingPoint(this.size, heading);
+    this.intents.sink.aimAt(point.xPx, point.yPx);
+  }
+  press(action) {
+    if (action !== "respawn") {
+      this.intents.sink.press(action);
+      return;
+    }
+    const { connection } = this.options;
+    const { phase } = connection;
+    if (phase.kind === "lost" || phase.kind === "unavailable") connection.retry();
+    else if (this.state.death !== null && !this.playAgain.isPending) this.playAgain.request();
+  }
+  /** Applies `message`; every one but a pong may change what the pane shows. */
+  receive(message) {
+    applyServerMessage(this.state, message, this.options.now());
+    this.playAgain.settle(this.state);
+    this.update();
+    if (message.type !== "pong") this.pacer.request();
+  }
+  changePhase(phase) {
+    applyPhase(this.state, phase);
+    this.playAgain.follow(phase);
+    this.update();
+    this.pacer.request();
+  }
+  /** Intents go out only while the player is in play (playing and alive), as on the web. */
+  update() {
+    this.intents.setActive(this.state.phase.kind === "playing" && this.state.death === null);
+  }
+  /**
+   * Draws the frame of now (the pacer calls it): interpolates the view, points the camera (which
+   * input maps the pane through), reports the status and has the surface's renderer draw the
+   * scene, written when it changed. Returns how many cells changed.
+   */
+  draw() {
+    const { state, frame, own, options } = this;
+    const now = options.now();
+    own.slot = state.ownSlot;
+    own.target = this.aim.worldTarget(this.camera, this.ownTarget);
+    interpolateView(state.snapshots, now, own, frame);
+    this.camera.update(cameraTarget(frame, state.mapSize, this.view), paneViewport(this.size), now);
+    const status = bridgeStatus(state, frame, options.origin);
+    this.report(status, now);
+    const scene = {
+      state,
+      frame,
+      camera: this.camera,
+      status,
+      isRespawning: this.playAgain.isPending,
+      origin: options.origin
+    };
+    return options.renderer.draw(scene, this.size, options.output);
+  }
+  /**
+   * Writes `status`, unless it only moved the player or changed its mass since one written less
+   * than the interval ago.
+   */
+  report(status, now) {
+    const last = this.reported;
+    const isTooSoon = now - this.reportedAt < MOTION_REPORT_INTERVAL_MS;
+    if (last !== null && isTooSoon && isMotionOnlyChange(last, status)) return;
+    this.reported = status;
+    this.reportedAt = now;
+    this.options.output.status(status);
+  }
+};
+
+// bridge/stdout-protocol.ts
+function readyLine(port, token) {
+  return `READY ${String(port)} ${token}
+`;
+}
+function frameLine(size, cells) {
+  const bytes = Buffer.from(cells.buffer, cells.byteOffset, cells.byteLength);
+  return `F ${String(size.columns)} ${String(size.rows)} ${bytes.toString("base64")}
+`;
+}
+function mapLine(rows) {
+  return `C ${JSON.stringify(rows)}
+`;
+}
+function hudLine(frame) {
+  return `V ${JSON.stringify(frame)}
+`;
+}
+function statusLine(status) {
+  return `S ${JSON.stringify(status)}
+`;
+}
+function errorLine(message) {
+  return `E ${message.replace(/\s*[\r\n]+\s*/g, " ")}
+`;
+}
+function writeProtocol(stream) {
+  let lastStatus = "";
+  let isBlocked = false;
+  const kinds = [];
+  let nextKind = 0;
+  const write = (line) => {
+    if (stream.write(line)) return true;
+    if (isBlocked) return false;
+    isBlocked = true;
+    stream.once("drain", () => {
+      isBlocked = false;
+      const inTurn = [...kinds.slice(nextKind), ...kinds.slice(0, nextKind)];
+      for (const kind of inTurn) {
+        const frame = kind.waiting;
+        if (frame === null) continue;
+        kind.waiting = null;
+        nextKind = (kinds.indexOf(kind) + 1) % kinds.length;
+        if (!write(frame)) break;
+      }
+    });
+    return false;
+  };
+  const frameKind = () => {
+    const kind = { last: "", waiting: null };
+    kinds.push(kind);
+    return (line) => {
+      if (line === kind.last) return;
+      kind.last = line;
+      if (isBlocked) kind.waiting = line;
+      else write(line);
+    };
+  };
+  const writeCells = frameKind();
+  const writeMap = frameKind();
+  const writeHud = frameKind();
+  return {
+    ready: (port, token) => {
+      write(readyLine(port, token));
+    },
+    frame: (size, cells) => {
+      writeCells(frameLine(size, cells));
+    },
+    mapRows: (rows) => {
+      writeMap(mapLine(rows));
+    },
+    hud: (frame) => {
+      writeHud(hudLine(frame));
+    },
+    status: (status) => {
+      const line = statusLine(status);
+      if (line === lastStatus) return;
+      lastStatus = line;
+      write(line);
+    },
+    error: (message) => {
+      write(errorLine(message));
+    }
+  };
 }
 
 // bridge/minimap.ts
@@ -3878,69 +4929,6 @@ function settleGlyphs(grid, box) {
   }
 }
 
-// bridge/ranking-box.ts
-var RANKING_TEXT = {
-  title: "Ranking",
-  /** A row whose slot the room has not named yet, as the web's `hud.leaderboard.unnamed`. */
-  unnamed: "Unnamed"
-};
-var RANK_COLUMNS = 3;
-var GAP = 1;
-var INSET = 2;
-var CUT_MARK2 = ".";
-var SPACE_GLYPH = 32;
-var OWN_ROW_TINT = 0.12;
-function rankingRows(model, width) {
-  const rows = model.top.slice(0, RANKING_TOP_ROWS).map((line) => rowOf(line, `${String(line.rank)}.`, width));
-  const own = model.top.find((line) => line.isOwn) ?? model.ownBelow;
-  if (own !== null && own.rank > RANKING_TOP_ROWS) {
-    rows.push(rowOf(own, `#${String(own.rank)}`, width));
-  }
-  return rows;
-}
-function fitName(name, room) {
-  const glyphs = glyphsOf(name);
-  if (glyphs.length <= room) return name;
-  if (room < 2) return "";
-  let length = room - 1;
-  while (glyphs[length - 1] === SPACE_GLYPH) length -= 1;
-  return String.fromCharCode(...glyphs.slice(0, length)) + CUT_MARK2;
-}
-function drawRanking(grid, place, model) {
-  const rows = rankingRows(model, place.width);
-  if (rows.length === 0) return;
-  const { left, width } = place;
-  drawPanel(grid, { left, top: 0, width, height: rows.length + 2 }, [
-    { text: RANKING_TEXT.title, colour: PANE_COLOURS.text }
-  ]);
-  rows.forEach((row, index) => {
-    writeRow(grid, { left, width, row: index + 1 }, row);
-  });
-}
-function rowOf(line, rank, width) {
-  const mass = NUMBER_FORMAT.format(line.mass);
-  const room = width - 2 * INSET - RANK_COLUMNS - 2 * GAP - mass.length;
-  return { rank, name: fitName(line.name ?? RANKING_TEXT.unnamed, room), mass, isOwn: line.isOwn };
-}
-function writeRow(grid, at, row) {
-  const first = at.left + INSET;
-  const end2 = at.left + at.width - INSET;
-  if (row.isOwn) {
-    for (let column = at.left + 1; column < at.left + at.width - 1; column += 1) {
-      veilCell(grid, grid.indexOf(column, at.row), PANE_COLOURS.mint, OWN_ROW_TINT);
-    }
-  }
-  const label = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.muted;
-  const name = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.text;
-  grid.writeRuns({ column: first, row: at.row, end: end2 }, [{ text: row.rank, colour: label }]);
-  grid.writeRuns({ column: first + RANK_COLUMNS + GAP, row: at.row, end: end2 }, [
-    { text: row.name, colour: name }
-  ]);
-  grid.writeRuns({ column: end2 - row.mass.length, row: at.row, end: end2 }, [
-    { text: row.mass, colour: label }
-  ]);
-}
-
 // bridge/hud.ts
 var PaneHud = class {
   minimap = new Minimap();
@@ -3963,250 +4951,33 @@ var PaneHud = class {
 // bridge/terminal-renderer.ts
 var TerminalRenderer = class {
   grid = new CellGrid();
-  canvas = new HalfBlockCanvas();
-  painter = new MapPainter();
-  labels = new CellLabels();
+  map = new PaneMap();
   hud = new PaneHud();
+  lastFrame = new LastFrame();
+  /**
+   * The terminal's frame (`Renderer.draw`): the cells of `scene` (`render`), written as an `F` line
+   * for `$.ui.blit` when any cell differs from the last frame drawn (`LastFrame`).
+   */
+  draw(scene, size, output) {
+    const cells = this.render(scene, size);
+    const changed = this.lastFrame.replace(size, cells);
+    if (changed > 0) output.frame(size, cells);
+    return changed;
+  }
   /**
    * The cells of `scene` on a pane of `size`. The array is the renderer's own and is rewritten by
    * the next call: copy what must outlive it.
    */
   render(scene, size) {
-    const { grid, canvas, painter } = this;
-    const { state, camera } = scene;
-    const rows = mapRows(size);
+    const { grid } = this;
     grid.resize(size);
-    canvas.resize(size.columns, rows * PIXELS_PER_ROW);
-    painter.paint(canvas, {
-      camera,
-      frame: scene.frame,
-      mapSize: state.mapSize,
-      pellets: state.pellets,
-      players: state.players,
-      slots: state.slots
-    });
-    canvas.composeInto(grid);
-    painter.slotLayer.write(grid, rows, painter.pelletPixels);
-    this.labels.write(grid, { camera, players: state.players, mapRows: rows }, painter.cells);
-    this.hud.draw(grid, size, { state, frame: scene.frame, camera });
-    drawOverlay(grid, rows, paneOverlay(scene));
+    this.map.draw(grid, scene, size);
+    this.hud.draw(grid, size, { state: scene.state, frame: scene.frame, camera: scene.camera });
+    drawOverlay(grid, mapRows(size), paneOverlay(scene));
     drawStatusRow(grid, size.rows - 1, scene.status);
     return grid.cells;
   }
 };
-
-// bridge/session.ts
-var BridgeSession = class {
-  constructor(options) {
-    this.options = options;
-    const { connection, now, timers } = options;
-    this.size = options.size;
-    this.intents = createIntentControl({
-      connection,
-      aim: this.aim,
-      camera: this.camera,
-      now,
-      timers
-    });
-    this.playAgain = new PlayAgain(connection);
-    this.pacer = new FramePacer({ now, timers, draw: () => this.draw() });
-    this.stops = [
-      connection.onMessage((message) => {
-        this.receive(message);
-      }),
-      connection.onPhase((phase) => {
-        this.changePhase(phase);
-      })
-    ];
-  }
-  options;
-  state = createClientState();
-  aim = new Aim();
-  camera = new Camera();
-  frame = createFrameView();
-  own = { slot: null, target: null };
-  ownTarget = { x: 0, y: 0 };
-  view = { centerX: 0, centerY: 0, halfWidth: 0, halfHeight: 0 };
-  intents;
-  playAgain;
-  stops;
-  renderer = new TerminalRenderer();
-  lastFrame = new LastFrame();
-  pacer;
-  size;
-  isStopped = false;
-  reported = null;
-  reportedAt = Number.NEGATIVE_INFINITY;
-  /**
-   * Joins the game (`connection.join`); frames and status lines follow from its first phase. A
-   * nickname the shared filter refuses never reaches the lobby: the connection is `rejected`
-   * (`nickname`) at once, whose card points to the plugin's option (`/config`).
-   */
-  start(request) {
-    this.options.connection.join(request);
-  }
-  /**
-   * Plays one control input:
-   * - `aim` / `keys`: steers at that pane point (keys: the pane's edge that way, or its centre);
-   * - `press` `split` / `eject`: presses it (only in play, as on the web);
-   * - `press` `respawn`: Play again while dead (once until the new life shows); "try now" /
-   *   "reconnect" while the lobby is full or the connection is lost; nothing otherwise;
-   * - `resize`: draws at the new size from now on.
-   * Each asks for a frame: an aim moves the player's predicted cells, a press may change a card.
-   * Once stopped, inputs are ignored (a request already in flight when the bridge ends).
-   */
-  handle(input) {
-    if (this.isStopped) return;
-    switch (input.kind) {
-      case "aim":
-        this.aimAt(input.x, input.y);
-        break;
-      case "keys":
-        this.aimAt(input.dx, input.dy);
-        break;
-      case "press":
-        this.press(input.action);
-        break;
-      case "resize":
-        this.size = { columns: input.columns, rows: input.rows };
-    }
-    this.pacer.request();
-  }
-  /** Stops sending and drawing, leaves the room and stops listening to the connection. */
-  stop() {
-    this.isStopped = true;
-    this.pacer.stop();
-    this.intents.stop();
-    for (const stop of this.stops) stop();
-    this.options.connection.leave();
-  }
-  aimAt(x, y) {
-    const point = panePoint(this.size, x, y);
-    this.intents.sink.aimAt(point.xPx, point.yPx);
-  }
-  press(action) {
-    if (action !== "respawn") {
-      this.intents.sink.press(action);
-      return;
-    }
-    const { connection } = this.options;
-    const { phase } = connection;
-    if (phase.kind === "lost" || phase.kind === "unavailable") connection.retry();
-    else if (this.state.death !== null && !this.playAgain.isPending) this.playAgain.request();
-  }
-  /** Applies `message`; every one but a pong may change what the pane shows. */
-  receive(message) {
-    applyServerMessage(this.state, message, this.options.now());
-    this.playAgain.settle(this.state);
-    this.update();
-    if (message.type !== "pong") this.pacer.request();
-  }
-  changePhase(phase) {
-    applyPhase(this.state, phase);
-    this.playAgain.follow(phase);
-    this.update();
-    this.pacer.request();
-  }
-  /** Intents go out only while the player is in play (playing and alive), as on the web. */
-  update() {
-    this.intents.setActive(this.state.phase.kind === "playing" && this.state.death === null);
-  }
-  /**
-   * Draws the frame of now (the pacer calls it): interpolates the view, points the camera (which
-   * input maps the pane through), reports the status and renders the cells, sent when they changed.
-   * Returns how many cells changed.
-   */
-  draw() {
-    const { state, frame, own, options } = this;
-    const now = options.now();
-    own.slot = state.ownSlot;
-    own.target = this.aim.worldTarget(this.camera, this.ownTarget);
-    interpolateView(state.snapshots, now, own, frame);
-    this.camera.update(cameraTarget(frame, state.mapSize, this.view), paneViewport(this.size), now);
-    const status = bridgeStatus(state, frame, options.origin);
-    this.report(status, now);
-    const scene = {
-      state,
-      frame,
-      camera: this.camera,
-      status,
-      isRespawning: this.playAgain.isPending,
-      origin: options.origin
-    };
-    const cells = this.renderer.render(scene, this.size);
-    const changed = this.lastFrame.replace(this.size, cells);
-    if (changed > 0) options.output.frame(this.size, cells);
-    return changed;
-  }
-  /**
-   * Writes `status`, unless it only moved the player or changed its mass since one written less
-   * than the interval ago.
-   */
-  report(status, now) {
-    const last = this.reported;
-    const isTooSoon = now - this.reportedAt < MOTION_REPORT_INTERVAL_MS;
-    if (last !== null && isTooSoon && isMotionOnlyChange(last, status)) return;
-    this.reported = status;
-    this.reportedAt = now;
-    this.options.output.status(status);
-  }
-};
-
-// bridge/stdout-protocol.ts
-function readyLine(port, token) {
-  return `READY ${String(port)} ${token}
-`;
-}
-function frameLine(size, cells) {
-  const bytes = Buffer.from(cells.buffer, cells.byteOffset, cells.byteLength);
-  return `F ${String(size.columns)} ${String(size.rows)} ${bytes.toString("base64")}
-`;
-}
-function statusLine(status) {
-  return `S ${JSON.stringify(status)}
-`;
-}
-function errorLine(message) {
-  return `E ${message.replace(/\s*[\r\n]+\s*/g, " ")}
-`;
-}
-function writeProtocol(stream) {
-  let lastFrame = "";
-  let lastStatus = "";
-  let waitingFrame = null;
-  let isBlocked = false;
-  const write = (line) => {
-    if (stream.write(line) || isBlocked) return;
-    isBlocked = true;
-    stream.once("drain", () => {
-      isBlocked = false;
-      const frame = waitingFrame;
-      waitingFrame = null;
-      if (frame !== null) write(frame);
-    });
-  };
-  return {
-    ready: (port, token) => {
-      write(readyLine(port, token));
-    },
-    frame: (size, cells) => {
-      const line = frameLine(size, cells);
-      if (line === lastFrame) return;
-      lastFrame = line;
-      if (isBlocked) waitingFrame = line;
-      else write(line);
-    },
-    status: (status) => {
-      const line = statusLine(status);
-      if (line === lastStatus) return;
-      lastStatus = line;
-      write(line);
-    },
-    error: (message) => {
-      write(errorLine(message));
-    }
-  };
-}
 
 // bridge/bridge.ts
 var EXIT_CODES = {
@@ -4220,6 +4991,10 @@ var EXIT_CODES = {
   unsupportedRuntime: 3
 };
 var LEAVE_DELAY_MS = 0;
+var RENDERERS = {
+  terminal: () => new TerminalRenderer(),
+  desktop: () => new DesktopRenderer()
+};
 async function runBridge(host) {
   const output = writeProtocol(host.output);
   if (host.runtimeProblem !== null) {
@@ -4247,7 +5022,8 @@ async function start(host, config, output) {
     now: () => host.now(),
     timers: host.timers,
     output,
-    size: config.size
+    size: config.size,
+    renderer: RENDERERS[config.surface]()
   });
   const token = host.createToken();
   let isEnding = false;

@@ -217,6 +217,86 @@ var InputQueue = class {
     if (this.steers.length < MAX_STEERS_PER_MESSAGE) this.steers.push(key);
   }
 };
+var MAP_REQUEST = { presses: [] };
+var MapPosts = class {
+  constructor(queue) {
+    this.queue = queue;
+  }
+  queue;
+  wasInput = false;
+  /** The next post, or `null` for a tick that posts nothing. */
+  next() {
+    const message = this.queue.take();
+    if (message !== null) {
+      this.wasInput = true;
+      return message;
+    }
+    if (this.wasInput) {
+      this.wasInput = false;
+      return null;
+    }
+    return MAP_REQUEST;
+  }
+};
+
+// src/map-tree.ts
+var HALF = "50%";
+function mapNodes(rows) {
+  return {
+    type: "Box",
+    props: {
+      flexDirection: "column",
+      width: rows.columns,
+      height: rows.rows,
+      backgroundColor: colourOf(rows.palette, 0),
+      overflow: "hidden"
+    },
+    children: rows.lines.map((line) => lineNode(line, rows.palette))
+  };
+}
+function lineNode(line, palette) {
+  if (typeof line === "number") return { type: "Box", props: { height: line } };
+  return {
+    type: "Box",
+    props: { flexDirection: "row", height: 1 },
+    children: line.map((segment) => segmentNode(segment, palette))
+  };
+}
+function segmentNode(segment, palette) {
+  const place = placeOf(segment);
+  if (segment.length === 3) {
+    return { type: "Box", props: { ...place, backgroundColor: colourOf(palette, segment[2]) } };
+  }
+  if (segment.length === 4) {
+    return {
+      type: "Box",
+      props: { ...place, height: 1, flexDirection: "column" },
+      children: [halfNode(segment[2], palette), halfNode(segment[3], palette)]
+    };
+  }
+  const [, , background, ink, text] = segment;
+  return {
+    type: "Box",
+    props: { ...place, ...backgroundOf(background, palette), overflow: "hidden" },
+    children: [{ type: "Text", props: { color: colourOf(palette, ink) }, children: [text] }]
+  };
+}
+function placeOf(segment) {
+  const [margin, width] = segment;
+  return margin > 0 ? { marginLeft: margin, width } : { width };
+}
+function halfNode(colour, palette) {
+  return { type: "Box", props: { height: HALF, ...backgroundOf(colour, palette) } };
+}
+function backgroundOf(colour, palette) {
+  return colour === 0 ? {} : { backgroundColor: colourOf(palette, colour) };
+}
+function colourOf(palette, colour) {
+  const css = palette[colour];
+  if (css === void 0)
+    throw new Error(`tokeneater: map colour ${String(colour)} is not in the palette`);
+  return css;
+}
 
 // plugin/hooks/surface-input.ts
 function listenForInput(surface, queue) {
@@ -231,20 +311,31 @@ function listenForInput(surface, queue) {
   });
 }
 
-// plugin/hooks/input-surface.tsx
-var InputSurface = (_props, surface) => {
+// plugin/hooks/map-surface.tsx
+var MapSurface = (rows, surface) => {
   if (surface.state === void 0) {
     const queue = new InputQueue();
     listenForInput(surface, queue);
+    const posts = new MapPosts(queue);
     surface.every(POST_INTERVAL_MS, () => {
-      const message = queue.take();
+      const message = posts.next();
       if (message !== null) surface.post({ ...message });
     });
     surface.setState({ queue });
   }
-  const { Box } = surface.elements;
-  return /* @__PURE__ */ h(Box, { width: surface.columns, height: surface.rows });
+  const { elements } = surface;
+  if (rows === null) return elements.Box({ width: surface.columns, height: surface.rows });
+  return drawNode(mapNodes(rows), elements);
 };
+function drawNode(node, elements) {
+  if (node.type === "Text") return elements.Text({ ...node.props, children: node.children });
+  const { children } = node;
+  if (children === void 0) return elements.Box(node.props);
+  return elements.Box({
+    ...node.props,
+    children: children.map((child) => drawNode(child, elements))
+  });
+}
 export {
-  InputSurface
+  MapSurface
 };
