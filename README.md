@@ -34,19 +34,22 @@ Then switch to the fullscreen layout (`/tui fullscreen`) and type `/tokeneater`.
 | Input | Does |
 | --- | --- |
 | Mouse over the pane | steers your cell |
-| `h` `j` `k` `l` (arrows after a click) | steer left, down, up, right |
-| `s` (Space after a click) | split |
-| `w` | eject mass |
+| `w` `a` `s` `d` (arrows too after a click) | steer up, left, down, right: the cell keeps going that way until you steer again |
+| `e` (Space too after a click) | split |
+| `q` | eject mass |
 | `r` (Enter after a click) | play again |
 | `Esc` | gives the keyboard back to the prompt |
+
+The pane shows the map with the ranking (the top 5 and your own row) in its top-right corner, a
+minimap in its bottom-right corner, and your mass, room and rank on its last row.
 
 ## Options
 
 `/plugin configure tokeneater@tokeneater` (or `claude plugin configure tokeneater@tokeneater`):
 
 - **Nickname**: the name other players see (up to 16 characters); empty lets the server pick one.
-- **Server URL**: the tokeneater server to play on, as an origin (`https://host`).
-  Default: `https://playtokeneater.com`.
+- **Open on prompt**: on by default, a prompt you send opens the game's pane by itself (in a
+  fullscreen terminal at least 144 columns wide). Off: only `/tokeneater` opens it.
 
 ## Updates
 

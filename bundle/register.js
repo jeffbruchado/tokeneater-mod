@@ -1,27 +1,18 @@
 // src/mod-options.ts
-var DEFAULT_SERVER_URL = "https://playtokeneater.com";
 function readOptions(options) {
-  const nickname = textOf(options["nickname"]);
-  const serverUrl = textOf(options["serverUrl"]);
+  const nickname = options["nickname"];
   return {
-    nickname,
-    serverUrl: serverUrl === "" ? DEFAULT_SERVER_URL : serverUrl,
+    nickname: typeof nickname === "string" ? nickname.trim() : "",
     isAutoOpenOn: options["autoOpen"] !== false
   };
 }
 function bridgeEnv(options, size) {
-  const env = {
-    TE_SERVER_URL: options.serverUrl,
-    TE_NICKNAME: options.nickname
-  };
+  const env = { TE_NICKNAME: options.nickname };
   if (size !== null) {
     env["TE_COLUMNS"] = String(size.columns);
     env["TE_ROWS"] = String(size.rows);
   }
   return env;
-}
-function textOf(value) {
-  return typeof value === "string" ? value.trim() : "";
 }
 
 // ../../packages/shared/src/legal.ts
@@ -82,13 +73,13 @@ var MOD_INSTALL = {
   autoOpenMinColumns: 144
 };
 var MOD_HOTKEYS = {
-  split: "s",
-  eject: "w",
+  split: "e",
+  eject: "q",
   respawn: "r",
-  left: "h",
-  down: "j",
-  up: "k",
-  right: "l"
+  up: "w",
+  left: "a",
+  down: "s",
+  right: "d"
 };
 
 // ../../packages/shared/src/protocol/messages.ts
@@ -196,7 +187,7 @@ var IDLE_NOTICE = "Press r to play.";
 var RESTARTING_NOTICE = "The game stopped: starting it again\u2026";
 var TOO_SMALL_NOTICE = "The pane is too small to play in: make it taller.";
 var RETRY_HINT = "Press r to try again.";
-var OPENED_TEXT = "tokeneater is open: steer with the pointer, or the letter keys shown under the game. Esc returns to the prompt.";
+var OPENED_TEXT = `tokeneater is open: steer with the pointer or ${MOD_HOTKEYS.up} ${MOD_HOTKEYS.left} ${MOD_HOTKEYS.down} ${MOD_HOTKEYS.right}, ${MOD_HOTKEYS.split} splits, ${MOD_HOTKEYS.eject} ejects (after a click on the map, the arrows and Space too). Esc returns to the prompt.`;
 var CLOSED_TEXT = "tokeneater closed.";
 var COMMAND_DESCRIPTION = "Play tokeneater in a side pane (run again to close it)";
 function turnToast(status) {
@@ -228,9 +219,9 @@ var PANE_KEYS = [
     label: "play again",
     input: { kind: "press", action: "respawn" }
   },
+  { id: "up", hotkey: MOD_HOTKEYS.up, label: "up", input: { kind: "keys", dx: 0, dy: -1 } },
   { id: "left", hotkey: MOD_HOTKEYS.left, label: "left", input: { kind: "keys", dx: -1, dy: 0 } },
   { id: "down", hotkey: MOD_HOTKEYS.down, label: "down", input: { kind: "keys", dx: 0, dy: 1 } },
-  { id: "up", hotkey: MOD_HOTKEYS.up, label: "up", input: { kind: "keys", dx: 0, dy: -1 } },
   { id: "right", hotkey: MOD_HOTKEYS.right, label: "right", input: { kind: "keys", dx: 1, dy: 0 } }
 ];
 

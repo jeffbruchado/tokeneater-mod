@@ -56,13 +56,13 @@ var MOD_INSTALL = {
   autoOpenMinColumns: 144
 };
 var MOD_HOTKEYS = {
-  split: "s",
-  eject: "w",
+  split: "e",
+  eject: "q",
   respawn: "r",
-  left: "h",
-  down: "j",
-  up: "k",
-  right: "l"
+  up: "w",
+  left: "a",
+  down: "s",
+  right: "d"
 };
 
 // ../../packages/shared/src/protocol/messages.ts
@@ -152,18 +152,18 @@ var PANE_KEYS = [
     label: "play again",
     input: { kind: "press", action: "respawn" }
   },
+  { id: "up", hotkey: MOD_HOTKEYS.up, label: "up", input: { kind: "keys", dx: 0, dy: -1 } },
   { id: "left", hotkey: MOD_HOTKEYS.left, label: "left", input: { kind: "keys", dx: -1, dy: 0 } },
   { id: "down", hotkey: MOD_HOTKEYS.down, label: "down", input: { kind: "keys", dx: 0, dy: 1 } },
-  { id: "up", hotkey: MOD_HOTKEYS.up, label: "up", input: { kind: "keys", dx: 0, dy: -1 } },
   { id: "right", hotkey: MOD_HOTKEYS.right, label: "right", input: { kind: "keys", dx: 1, dy: 0 } }
 ];
 var SURFACE_KEYS = /* @__PURE__ */ new Map([
   [" ", { kind: "press", action: "split" }],
   ["space", { kind: "press", action: "split" }],
   ["return", { kind: "press", action: "respawn" }],
+  ["up", { kind: "keys", dx: 0, dy: -1 }],
   ["left", { kind: "keys", dx: -1, dy: 0 }],
   ["down", { kind: "keys", dx: 0, dy: 1 }],
-  ["up", { kind: "keys", dx: 0, dy: -1 }],
   ["right", { kind: "keys", dx: 1, dy: 0 }]
 ]);
 function inputForKey(key) {

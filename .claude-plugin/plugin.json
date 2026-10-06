@@ -1,6 +1,6 @@
 {
   "name": "tokeneater",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Play tokeneater, the multiplayer cell-eating game, in a terminal pane while a prompt runs.",
   "author": {
     "name": "Jefferson Bruchado"
@@ -12,12 +12,6 @@
       "title": "Nickname",
       "description": "The name other players see above your cell (up to 16 characters). Empty: the server picks one.",
       "default": ""
-    },
-    "serverUrl": {
-      "type": "string",
-      "title": "Server URL",
-      "description": "The tokeneater server to play on, as an origin (https://host).",
-      "default": "https://playtokeneater.com"
     },
     "autoOpen": {
       "type": "boolean",

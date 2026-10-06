@@ -763,7 +763,7 @@ function encodeClient(message, mapSize = MAP_SIZE) {
 }
 
 // ../../packages/shared/src/protocol/slots.ts
-var SLOT_TIERS = ["small", "medium", "large"];
+var SLOT_TIERS = ["small", "medium", "large", "xl"];
 var MAX_SLOTS = 32;
 var SLOT_ID_PATTERN = /^[A-Za-z0-9-]{1,16}$/;
 var SLOT_ID_MAX_BYTES = 16;
@@ -2272,6 +2272,20 @@ function sameBytes(left, right) {
   return left.length === right.length && left.every((byte, index) => byte === right[index]);
 }
 
+// ../../packages/shared/src/client/state/leaderboard-model.ts
+function leaderboardModel(state) {
+  const nameOf = (slot) => slot === null ? null : state.players[slot]?.nickname ?? null;
+  const top = state.leaderboard.map((row, index) => ({
+    rank: index + 1,
+    name: nameOf(row.slot),
+    mass: row.mass,
+    isOwn: row.slot === state.ownSlot
+  }));
+  const isOwnInTop = top.some((line) => line.isOwn);
+  const ownBelow = state.ownRank === null || isOwnInTop ? null : { rank: state.ownRank, name: nameOf(state.ownSlot), mass: state.ownMass, isOwn: true };
+  return { top, ownBelow };
+}
+
 // ../../packages/shared/src/client/state/play-again.ts
 var PlayAgain = class {
   constructor(connection) {
@@ -2542,6 +2556,7 @@ function end(response, status, text) {
 }
 
 // bridge/env.ts
+var DEFAULT_SERVER_URL = "https://playtokeneater.com";
 var BRIDGE_ENV = {
   serverUrl: "TE_SERVER_URL",
   nickname: "TE_NICKNAME",
@@ -2550,7 +2565,8 @@ var BRIDGE_ENV = {
   rows: "TE_ROWS"
 };
 function parseBridgeEnv(env) {
-  const server = parseServerUrl(env[BRIDGE_ENV.serverUrl] ?? "");
+  const serverUrl = env[BRIDGE_ENV.serverUrl] ?? "";
+  const server = parseServerUrl(serverUrl === "" ? DEFAULT_SERVER_URL : serverUrl);
   if (server === null) {
     return {
       ok: false,
@@ -2879,6 +2895,15 @@ var PANE_COLOURS = {
   text: cellColour(DESIGN_COLOURS.text),
   muted: cellColour(DESIGN_COLOURS.muted)
 };
+function mixCellColours(from, to, amount) {
+  let mixed = 0;
+  for (let shift = 16; shift >= 0; shift -= 8) {
+    const a = from >> shift & 255;
+    const b = to >> shift & 255;
+    mixed |= Math.round(a + (b - a) * amount) << shift;
+  }
+  return mixed;
+}
 var UNKNOWN_PLAYER_TINT = DESIGN_COLOURS.muted;
 function playerTint(colour) {
   return PLAYER_COLOURS[colour] ?? UNKNOWN_PLAYER_TINT;
@@ -3371,6 +3396,43 @@ var HalfBlockCanvas = class {
   }
 };
 
+// bridge/hud-layout.ts
+var HUD_MARGIN_COLUMNS = 1;
+var RANKING_TOP_ROWS = 5;
+var RANKING_MAX_HEIGHT = RANKING_TOP_ROWS + 3;
+var RANKING_COLUMNS = 26;
+var RANKING_MIN_COLUMNS = 18;
+var RANKING_MAX_SHARE = 0.4;
+var RANKING_MIN_MAP_ROWS = 2 * RANKING_MAX_HEIGHT;
+var MINIMAP_MAX_SIDE = 24;
+var MINIMAP_MIN_SIDE = 10;
+var MINIMAP_MAX_SHARE = 0.25;
+var BORDER = 1;
+function hudLayout(size) {
+  const rows = mapRows(size);
+  const rankingWidth = Math.min(RANKING_COLUMNS, Math.floor(size.columns * RANKING_MAX_SHARE));
+  const hasRanking = rankingWidth >= RANKING_MIN_COLUMNS && rows >= RANKING_MIN_MAP_ROWS;
+  const ranking = hasRanking ? { left: size.columns - HUD_MARGIN_COLUMNS - rankingWidth, width: rankingWidth } : null;
+  const freeRows = rows - (hasRanking ? RANKING_MAX_HEIGHT + 1 : 0);
+  const side = evenFloor(
+    Math.min(
+      MINIMAP_MAX_SIDE,
+      Math.floor(size.columns * MINIMAP_MAX_SHARE) - 2 * BORDER,
+      (freeRows - 2 * BORDER) * 2
+    )
+  );
+  if (side < MINIMAP_MIN_SIDE) return { ranking, minimap: null };
+  const width = side + 2 * BORDER;
+  const height = side / 2 + 2 * BORDER;
+  return {
+    ranking,
+    minimap: { left: size.columns - HUD_MARGIN_COLUMNS - width, top: rows - height, width, height }
+  };
+}
+function evenFloor(value) {
+  return Math.floor(value / 2) * 2;
+}
+
 // bridge/death-credit.ts
 var CREDIT_TEXT = {
   credit: "Map spot by ",
@@ -3402,7 +3464,7 @@ function creditLines(state, death, origin) {
 var NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 var ROW_PADDING = 1;
 var ITEM_GAP = 2;
-var KEYS = { split: "s", eject: "w", respawn: "r" };
+var KEYS = { split: "e", eject: "q", respawn: "r" };
 var HINT_COLOURS = {
   key: PANE_COLOURS.text,
   chip: PANE_COLOURS.border,
@@ -3669,12 +3731,242 @@ function drawBorder(grid, box) {
   grid.paint(grid.indexOf(right, bottom), BOX.bottomRight, colours);
 }
 
+// bridge/hud-panel.ts
+var PANEL_VEIL = 0.8;
+function topPixelOf(grid, index) {
+  const { cells } = grid;
+  return (cells[index] === UPPER_HALF_BLOCK ? cells[index + 1] : cells[index + 2]) ?? 0;
+}
+function bottomPixelOf(grid, index) {
+  return grid.cells[index + 2] ?? 0;
+}
+function veilCell(grid, index, tint, amount) {
+  if (index < 0) return;
+  const top = mixCellColours(topPixelOf(grid, index), tint, amount);
+  const bottom = mixCellColours(bottomPixelOf(grid, index), tint, amount);
+  const { cells } = grid;
+  cells[index] = top === bottom ? SPACE : UPPER_HALF_BLOCK;
+  cells[index + 1] = top;
+  cells[index + 2] = bottom;
+}
+function drawPanel(grid, box, title2 = []) {
+  const right = box.left + box.width - 1;
+  const bottom = box.top + box.height - 1;
+  for (let row = box.top; row <= bottom; row += 1) {
+    for (let column = box.left; column <= right; column += 1) {
+      veilCell(grid, grid.indexOf(column, row), PANE_COLOURS.surface, PANEL_VEIL);
+    }
+  }
+  const { border } = PANE_COLOURS;
+  for (let column = box.left + 1; column < right; column += 1) {
+    grid.ink(grid.indexOf(column, box.top), BOX.horizontal, border);
+    grid.ink(grid.indexOf(column, bottom), BOX.horizontal, border);
+  }
+  for (let row = box.top + 1; row < bottom; row += 1) {
+    grid.ink(grid.indexOf(box.left, row), BOX.vertical, border);
+    grid.ink(grid.indexOf(right, row), BOX.vertical, border);
+  }
+  grid.ink(grid.indexOf(box.left, box.top), BOX.topLeft, border);
+  grid.ink(grid.indexOf(right, box.top), BOX.topRight, border);
+  grid.ink(grid.indexOf(box.left, bottom), BOX.bottomLeft, border);
+  grid.ink(grid.indexOf(right, bottom), BOX.bottomRight, border);
+  if (title2.length === 0) return;
+  const at = { column: box.left + 2, row: box.top, end: right - 1 };
+  const end2 = grid.writeRuns(at, [{ text: " ", colour: border }, ...title2]);
+  grid.writeRuns({ column: end2, row: box.top, end: right - 1 }, [{ text: " ", colour: border }]);
+}
+
+// bridge/minimap.ts
+var MARK_SHARES = {
+  grid: 0.55,
+  sponsoredSlot: 0.7,
+  emptySlot: 0.25,
+  viewEdge: 0.55,
+  viewFill: 0.06
+};
+var GRID_DIVISIONS = 4;
+var FLOOR = mixCellColours(PANE_COLOURS.map, PANE_COLOURS.surface, PANEL_VEIL);
+var MINIMAP_COLOURS = {
+  floor: FLOOR,
+  grid: mixCellColours(FLOOR, PANE_COLOURS.border, MARK_SHARES.grid),
+  viewEdge: mixCellColours(FLOOR, PANE_COLOURS.text, MARK_SHARES.viewEdge),
+  viewFill: mixCellColours(FLOOR, PANE_COLOURS.text, MARK_SHARES.viewFill),
+  /** The player's dots: mint, as its cells on the map. */
+  own: PANE_COLOURS.mint
+};
+var Minimap = class {
+  set = null;
+  looks = [];
+  view = { fromX: 0, toX: 0, fromY: 0, toY: 0 };
+  slot = { fromX: 0, toX: 0, fromY: 0, toY: 0 };
+  /** Draws the minimap of `scene` in `box` (`HudLayout.minimap`) of `grid`. */
+  draw(grid, box, scene) {
+    drawPanel(grid, box);
+    const side = box.width - 2;
+    const pen = { grid, box };
+    const scale = side / scene.mapSize;
+    fillRect(pen, { fromX: 0, toX: side - 1, fromY: 0, toY: side - 1 }, MINIMAP_COLOURS.floor);
+    for (let line = 1; line < GRID_DIVISIONS; line += 1) {
+      const at = Math.round(line * side / GRID_DIVISIONS);
+      fillRect(pen, { fromX: at, toX: at, fromY: 0, toY: side - 1 }, MINIMAP_COLOURS.grid);
+      fillRect(pen, { fromX: 0, toX: side - 1, fromY: at, toY: at }, MINIMAP_COLOURS.grid);
+    }
+    const { camera } = scene;
+    const view = project(this.view, camera, scale, side);
+    fillRect(pen, view, MINIMAP_COLOURS.viewFill);
+    this.drawSlots(pen, scene.slots, scale, side);
+    drawEdge(pen, view);
+    for (const cell of scene.frame.cells) {
+      if (!cell.isOwn) continue;
+      const x = toPixel(cell.x, scale, side);
+      const y = toPixel(cell.y, scale, side);
+      fillRect(pen, { fromX: x, toX: x, fromY: y, toY: y }, MINIMAP_COLOURS.own);
+    }
+    settleGlyphs(grid, box);
+  }
+  /** Each slot of `slots` filled in its colour (`slotFill`), under the view's edge and the dots. */
+  drawSlots(pen, slots, scale, side) {
+    if (slots !== this.set) {
+      this.set = slots;
+      this.looks = slots === null ? [] : slots.slots.map((slot) => ({ slot, fill: slotFill(slot.sponsor) }));
+    }
+    for (const { slot, fill } of this.looks) {
+      const area = { minX: slot.x, minY: slot.y, maxX: slot.x + slot.w, maxY: slot.y + slot.h };
+      fillRect(pen, project(this.slot, area, scale, side), fill);
+    }
+  }
+};
+function project(out, area, scale, side) {
+  out.fromX = toPixel(area.minX, scale, side);
+  out.fromY = toPixel(area.minY, scale, side);
+  out.toX = Math.max(out.fromX, Math.min(Math.ceil(area.maxX * scale) - 1, side - 1));
+  out.toY = Math.max(out.fromY, Math.min(Math.ceil(area.maxY * scale) - 1, side - 1));
+  return out;
+}
+function drawEdge(pen, view) {
+  const colour = MINIMAP_COLOURS.viewEdge;
+  fillRect(pen, { ...view, toY: view.fromY }, colour);
+  fillRect(pen, { ...view, fromY: view.toY }, colour);
+  fillRect(pen, { ...view, toX: view.fromX }, colour);
+  fillRect(pen, { ...view, fromX: view.toX }, colour);
+}
+function slotFill(sponsor) {
+  const colour = cellColour(slotColour(sponsor?.colour ?? null, DESIGN_COLOURS.background));
+  const share = sponsor === null ? MARK_SHARES.emptySlot : MARK_SHARES.sponsoredSlot;
+  return mixCellColours(FLOOR, colour, share);
+}
+function toPixel(value, scale, side) {
+  return Math.min(Math.max(Math.floor(value * scale), 0), side - 1);
+}
+function fillRect(pen, rect, colour) {
+  const { grid, box } = pen;
+  for (let y = rect.fromY; y <= rect.toY; y += 1) {
+    for (let x = rect.fromX; x <= rect.toX; x += 1) {
+      const index = grid.indexOf(box.left + 1 + x, box.top + 1 + (y >> 1));
+      if (index >= 0) grid.cells[index + 1 + (y & 1)] = colour;
+    }
+  }
+}
+function settleGlyphs(grid, box) {
+  const { cells } = grid;
+  for (let row = box.top + 1; row < box.top + box.height - 1; row += 1) {
+    for (let column = box.left + 1; column < box.left + box.width - 1; column += 1) {
+      const index = grid.indexOf(column, row);
+      if (index < 0) continue;
+      cells[index] = cells[index + 1] === cells[index + 2] ? SPACE : UPPER_HALF_BLOCK;
+    }
+  }
+}
+
+// bridge/ranking-box.ts
+var RANKING_TEXT = {
+  title: "Ranking",
+  /** A row whose slot the room has not named yet, as the web's `hud.leaderboard.unnamed`. */
+  unnamed: "Unnamed"
+};
+var RANK_COLUMNS = 3;
+var GAP = 1;
+var INSET = 2;
+var CUT_MARK2 = ".";
+var SPACE_GLYPH = 32;
+var OWN_ROW_TINT = 0.12;
+function rankingRows(model, width) {
+  const rows = model.top.slice(0, RANKING_TOP_ROWS).map((line) => rowOf(line, `${String(line.rank)}.`, width));
+  const own = model.top.find((line) => line.isOwn) ?? model.ownBelow;
+  if (own !== null && own.rank > RANKING_TOP_ROWS) {
+    rows.push(rowOf(own, `#${String(own.rank)}`, width));
+  }
+  return rows;
+}
+function fitName(name, room) {
+  const glyphs = glyphsOf(name);
+  if (glyphs.length <= room) return name;
+  if (room < 2) return "";
+  let length = room - 1;
+  while (glyphs[length - 1] === SPACE_GLYPH) length -= 1;
+  return String.fromCharCode(...glyphs.slice(0, length)) + CUT_MARK2;
+}
+function drawRanking(grid, place, model) {
+  const rows = rankingRows(model, place.width);
+  if (rows.length === 0) return;
+  const { left, width } = place;
+  drawPanel(grid, { left, top: 0, width, height: rows.length + 2 }, [
+    { text: RANKING_TEXT.title, colour: PANE_COLOURS.text }
+  ]);
+  rows.forEach((row, index) => {
+    writeRow(grid, { left, width, row: index + 1 }, row);
+  });
+}
+function rowOf(line, rank, width) {
+  const mass = NUMBER_FORMAT.format(line.mass);
+  const room = width - 2 * INSET - RANK_COLUMNS - 2 * GAP - mass.length;
+  return { rank, name: fitName(line.name ?? RANKING_TEXT.unnamed, room), mass, isOwn: line.isOwn };
+}
+function writeRow(grid, at, row) {
+  const first = at.left + INSET;
+  const end2 = at.left + at.width - INSET;
+  if (row.isOwn) {
+    for (let column = at.left + 1; column < at.left + at.width - 1; column += 1) {
+      veilCell(grid, grid.indexOf(column, at.row), PANE_COLOURS.mint, OWN_ROW_TINT);
+    }
+  }
+  const label = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.muted;
+  const name = row.isOwn ? PANE_COLOURS.mint : PANE_COLOURS.text;
+  grid.writeRuns({ column: first, row: at.row, end: end2 }, [{ text: row.rank, colour: label }]);
+  grid.writeRuns({ column: first + RANK_COLUMNS + GAP, row: at.row, end: end2 }, [
+    { text: row.name, colour: name }
+  ]);
+  grid.writeRuns({ column: end2 - row.mass.length, row: at.row, end: end2 }, [
+    { text: row.mass, colour: label }
+  ]);
+}
+
+// bridge/hud.ts
+var PaneHud = class {
+  minimap = new Minimap();
+  /** Draws the HUD of `scene` over the composed map of `grid`, a pane of `size`. */
+  draw(grid, size, scene) {
+    const { state } = scene;
+    if (state.phase.kind !== "playing" && state.phase.kind !== "reconnecting") return;
+    const layout = hudLayout(size);
+    if (layout.ranking !== null) drawRanking(grid, layout.ranking, leaderboardModel(state));
+    if (layout.minimap === null) return;
+    this.minimap.draw(grid, layout.minimap, {
+      camera: scene.camera,
+      frame: scene.frame,
+      mapSize: state.mapSize,
+      slots: state.slots
+    });
+  }
+};
+
 // bridge/terminal-renderer.ts
 var TerminalRenderer = class {
   grid = new CellGrid();
   canvas = new HalfBlockCanvas();
   painter = new MapPainter();
   labels = new CellLabels();
+  hud = new PaneHud();
   /**
    * The cells of `scene` on a pane of `size`. The array is the renderer's own and is rewritten by
    * the next call: copy what must outlive it.
@@ -3696,6 +3988,7 @@ var TerminalRenderer = class {
     canvas.composeInto(grid);
     painter.slotLayer.write(grid, rows, painter.pelletPixels);
     this.labels.write(grid, { camera, players: state.players, mapRows: rows }, painter.cells);
+    this.hud.draw(grid, size, { state, frame: scene.frame, camera });
     drawOverlay(grid, rows, paneOverlay(scene));
     drawStatusRow(grid, size.rows - 1, scene.status);
     return grid.cells;
