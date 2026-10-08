@@ -63,3 +63,7 @@ click the map (the buttons under it play too).
 Third-party marketplaces do not update by themselves unless you turn auto-update on for them in
 `/plugin` → Marketplaces. To update by hand: `/plugin marketplace update tokeneater`, then
 `/plugin` → Installed → tokeneater → Update now.
+
+## License
+
+[MIT](LICENSE). Play in the browser at [playtokeneater.com](https://playtokeneater.com).
